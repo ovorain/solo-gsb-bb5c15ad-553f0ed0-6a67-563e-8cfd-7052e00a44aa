@@ -1,0 +1,894 @@
+# Release Wave Planning API（发布波次规划服务）
+
+基于 **Python 3.11 + FastAPI + OR-Tools CP-SAT** 的发布波次规划服务。客户端提交
+服务依赖图、每波并发上限以及不能同波发布的故障域，服务给出**顺序确定、波次最少**
+的发布方案；依赖成环或在给定发布窗口内无法排入时，返回**可定位到具体服务与约束**
+的结构化原因。方案持久化到 SQLite，支持查询与删除；`POST /plans/{id}/simulate`
+可在不落库的前提下模拟约束变更对方案的影响；`POST /plans/{id}/gate` 基于已存储的
+（不可变）波次方案做发布执行门禁，上报已完成与执行失败的服务后，逐波给出可执行
+服务、阻塞服务及可定位原因；`POST /plans/{id}/rollback-preview` 针对当前已上线
+（仍在运行）的服务给出**波次最少、顺序确定**的回滚波次预览（只读，不改方案）；
+`POST /plans/{id}/timeline-audit` 对发布后实际上报的逐服务执行时间线做审计：按
+已存波次与依赖校验启动顺序、返回每条违规与重叠毫秒数，并给出各波实际耗时与依赖
+DAG 上按服务实际耗时加权的关键链（只读，不改方案）。
+`POST /plans/{id}/ownership-audit` 接收「服务 → 负责团队」映射与每团队同时值班
+上限，沿已存依赖图做**只读责任域审计**：跨团队依赖链、无负责人服务、故障域内的
+团队耦合与每团队负责服务数/超限波次，并按依赖拓扑给出需要协同的团队顺序（结果
+稳定排序、不落库）。
+`GET /plans/{id}/slack-report` 只读计算当前最优波次方案的**服务松弛度**：在不增加
+总波次数且仍满足依赖、并发与故障域约束的前提下，每个服务最多可以向后移动几个波，
+并列出零松弛的关键服务及受其约束的零松弛下游（使用同一确定性求解器，结果不落库）。
+`GET /plans/{id}/bundle` 把请求约束、求解结果与版本元数据按规范 JSON 固定排序
+导出为带 SHA-256 的离线归档；`POST /plans/import` 校验摘要、schema、依赖/故障域
+引用与结果一致性后以事务写入新方案（波次结果原样保留、不重新求解），重复摘要
+幂等返回既有方案。容器启动时自动安装依赖并建表。
+
+## 一条命令启动
+
+```bash
+docker compose up --build -d
+```
+
+启动后访问：
+
+| 地址 | 说明 |
+| --- | --- |
+| http://localhost:8000 | API 根地址 |
+| http://localhost:8000/health | 健康检查 |
+| http://localhost:8000/docs | Swagger UI（可直接发请求） |
+| http://localhost:8000/openapi.json | OpenAPI 描述 |
+
+停止并保留数据：`docker compose down`；连同数据卷一起清除：`docker compose down -v`。
+
+> 端口可通过环境变量调整：`PLANNER_PORT=9000 docker compose up --build -d`。
+
+容器启动后门禁接口即随服务一起可用（无需额外组件或迁移，数据落在 `planner-data`
+命名卷）。快速体验：先 `POST /plans` 建一个方案记下返回的 `id`，再把当前发布
+进度发给门禁：
+
+```bash
+curl -X POST http://localhost:8000/plans/<id>/gate \
+  -H 'Content-Type: application/json' \
+  -d '{"completed_services": ["svc-a"], "failed_services": []}'
+```
+
+## 请求示例
+
+```bash
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "payment-platform",
+    "services": ["web", "api", "auth", "db", "cache"],
+    "dependencies": [
+      {"service": "web", "depends_on": "api"},
+      {"service": "api",  "depends_on": "auth"},
+      {"service": "api",  "depends_on": "db"},
+      {"service": "auth", "depends_on": "db"}
+    ],
+    "max_concurrency": 2,
+    "fault_domains": [
+      {"domain": "az-a", "services": ["db", "cache"]}
+    ],
+    "max_waves": null
+  }'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "name": "payment-platform",
+  "waves": [
+    {"index": 1, "services": ["db"]},
+    {"index": 2, "services": ["auth"]},
+    {"index": 3, "services": ["api"]},
+    {"index": 4, "services": ["cache", "web"]}
+  ],
+  "wave_count": 4,
+  "max_concurrency": 2,
+  "max_waves": null,
+  "optimal": true,
+  "created_at": "2026-09-21T12:00:00+00:00"
+}
+```
+
+## 约束语义
+
+- **依赖（dependencies）**：`service -> depends_on`，被依赖服务必须出现在更早的波次；
+  依赖图必须是 DAG。
+- **每波并发上限（max_concurrency）**：每波服务数不超过该值。
+- **故障域（fault_domains）**：同一 `domain` 内的任意两个服务不能出现在同一波
+  （反亲和）。典型用法：一个物理故障域（机房/可用区/机架）对应一条记录，列出其中的
+  服务；若两个服务跨多个域同时冲突，只需让它们在任一域内同组即可。
+- **发布窗口（max_waves，可选）**：传入后若最优方案需要更多波，返回 422 及原因；
+  不传则以「波次最少」为目标（DAG 下始终可排）。
+
+**确定性**：CP-SAT 固定随机种子、单搜索线程，并在「最少波次」基础上做第二阶段
+优化，使服务尽量靠前且波内按 id 排序。相同输入永远得到相同输出。
+`optimal=true` 表示求解器证明了波次最少；`false` 仅在触发求解时间上限时出现
+（此时方案仍可行但不保证最优）。
+
+## 约束变更模拟（POST /plans/{id}/simulate）
+
+在已存储方案的基础上评估「如果约束这样改，方案会变成什么样」。**只读不落库**，
+不影响已有记录。请求体所有字段均可选，未提供的约束保持原方案的值：
+
+```bash
+curl -X POST http://localhost:8000/plans/1/simulate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "max_concurrency": 3,
+    "add_dependencies": [{"service": "web", "depends_on": "cache"}],
+    "remove_dependencies": [{"service": "api", "depends_on": "db"}],
+    "add_fault_domains": [{"domain": "az-b", "services": ["api", "auth"]}],
+    "remove_fault_domains": ["az-a"]
+  }'
+```
+
+变更语义：
+
+- **删除**必须命中已存储的约束，否则 422（`dependency_not_found` /
+  `fault_domain_not_found`），便于发现客户端与服务端的状态漂移。
+- **修改故障域** = 同一请求内先 `remove_fault_domains` 再同名 `add_fault_domains`；
+  未删除就重复添加同名域返回 422 `duplicate_fault_domain`。
+- 添加已存在的依赖边视为无操作（与创建时重复边静默合并一致）。
+- 原方案的 `max_waves` 发布窗口**不参与**模拟——模拟直接报告波次增减。
+
+求解目标按字典序：**先保证新方案波次最少，再在其中最小化相对原方案的换波
+服务数**，最后做与创建相同的规范化，保证确定性（`optimal=true` 表示波次数与
+换波数都被证明最小；触发求解时间上限时为 `false`，结果仍可行但不保证最优）。
+
+响应：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "waves": [
+    {"index": 1, "services": ["db"]},
+    {"index": 2, "services": ["auth", "cache"]}
+  ],
+  "wave_count": 5,
+  "original_wave_count": 4,
+  "wave_delta": 1,
+  "max_concurrency": 3,
+  "optimal": true,
+  "assignments": [
+    {"service": "api", "from_wave": 3, "to_wave": 4}
+  ],
+  "moved_services": ["api"],
+  "affected_services": ["api", "auth", "cache", "web"]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `waves` / `wave_count` | 模拟得到的新波次（结构同创建响应） |
+| `original_wave_count` / `wave_delta` | 原波次数与增减量（新 − 原，正为增波） |
+| `assignments` | 每个服务的原/新波次（1 起始，按服务 id 排序） |
+| `moved_services` | 换了波次的服务 |
+| `affected_services` | 被**新增**约束直接引用的服务（新增依赖的两端、新增故障域的成员） |
+
+模拟不可行时返回与创建相同的结构化 422：新增依赖成环（`dependency_cycle`）、
+引用未知服务（`unknown_dependency_*` / `unknown_fault_domain_member`）、
+删除不存在的约束等，均可定位到具体服务与约束。
+
+## 执行门禁（POST /plans/{id}/gate）
+
+发布过程中持续上报本方案内**已完成**与**执行失败**的服务，门禁严格按照**已存储的
+波次方案与依赖图**（不会被门禁修改、不会重排）逐波判定剩余服务：
+
+- 所有直接依赖均已完成 → **可执行**；
+- 否则**阻塞**，并为每个有问题的依赖给出一条可定位原因；
+- 失败沿「依赖于」边**向下游递归传播**：直接依赖失败为 `dependency_failed`，
+  依赖被更上游的失败阻塞为 `upstream_failure`（context 中给出失败根因），
+  依赖既未失败也未完成为 `dependency_incomplete`。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/gate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "completed_services": ["db"],
+    "failed_services": ["cache"]
+  }'
+```
+
+（承接上面 `payment-platform` 示例：存储波次为 `[db] → [auth] → [api] → [cache, web]`，
+门禁不会改变它。）
+
+响应：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "current_wave": 2,
+  "executable_services": ["auth"],
+  "blocked_services": [
+    {
+      "service": "api",
+      "wave": 3,
+      "reasons": [
+        {
+          "code": "dependency_incomplete",
+          "message": "Service 'api' is blocked because its dependency 'auth' is not completed yet.",
+          "constraint": "dependencies",
+          "service": "api",
+          "related_services": ["auth"],
+          "context": {"dependency": "auth", "dependency_status": "pending", "wave": 3}
+        }
+      ]
+    },
+    {
+      "service": "web",
+      "wave": 4,
+      "reasons": [
+        {
+          "code": "dependency_incomplete",
+          "message": "Service 'web' is blocked because its dependency 'api' is not completed yet.",
+          "constraint": "dependencies",
+          "service": "web",
+          "related_services": ["api"],
+          "context": {"dependency": "api", "dependency_status": "pending", "wave": 4}
+        }
+      ]
+    }
+  ],
+  "completed_services": ["db"],
+  "failed_services": ["cache"],
+  "waves": [
+    {"index": 1, "executable": [], "blocked": [], "completed": ["db"], "failed": []},
+    {"index": 2, "executable": ["auth"], "blocked": [], "completed": [], "failed": []},
+    {"index": 3, "executable": [], "blocked": ["api"], "completed": [], "failed": []},
+    {"index": 4, "executable": [], "blocked": ["web"], "completed": [], "failed": ["cache"]}
+  ]
+}
+```
+
+失败递归传播的例子：`db` 失败后，直接依赖它的 `auth` 以 `dependency_failed`
+阻塞，而 `api`、`web` 即使只间接依赖 `db`，也会以 `upstream_failure` 阻塞，
+其 `context.failed_roots` 给出失败根因 `["db"]`，方便沿链定位。
+
+| 字段 | 含义 |
+| --- | --- |
+| `current_wave` | 仍存在可执行服务的**最早波次**（1 起始）；全部完成或全部阻塞时为 `null` |
+| `executable_services` | 当前可执行的剩余服务：先按存储波次归组、波内按 id 排序（同波服务互不影响） |
+| `blocked_services[].reasons` | 每个阻塞服务对应一条或多条原因，均带 `service` / `related_services` / `context`，可直接定位到出问题的依赖 |
+| `waves` | 存储方案每个波次的可执行/阻塞/已完成/已失败拆分（波次方案本身不变） |
+| `completed_services` / `failed_services` | 回显已排序、去重后的上报状态 |
+
+进度上报本身做一致性校验，冲突时统一返回 **422**（信封同下）：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `unknown_service` | 上报了不属于本方案的服务（区分 `completed_services` / `failed_services`） |
+| `duplicate_service_status` | 同一列表中服务重复出现 |
+| `service_status_conflict` | 同一服务同时上报为完成和失败 |
+| `completed_with_failed_dependency` | 上报完成，但其依赖链上（含跨未上报服务的传递路径）存在失败服务 |
+| `completed_before_dependencies` | 上报完成，但其直接依赖尚未全部完成（与存储的发布顺序矛盾） |
+
+门禁为只读操作，不写库：重复请求得到相同结果（确定性），方案不存在时返回 404。
+
+## 回滚波次预览（POST /plans/{id}/rollback-preview）
+
+当部分（或全部）服务已经上线、需要规划回滚时，把**当前已上线（仍在运行）的服务**
+发给本接口。服务只为这些上线服务生成回滚波次：
+
+- **回滚顺序**：某服务必须**晚于所有已上线且依赖它的下游服务**回滚，即回滚顺序
+  是发布顺序的逆序（在「上线服务」诱导子图上把依赖边反向后按同一波次模型求解）；
+  尚未上线的服务不参与，也不会阻塞其上游回滚。
+- **约束继承**：继续使用原方案的**每波并发上限**与**故障域反亲和**
+  （故障域只保留其中已上线的成员）。
+- **目标**：波次最少；同输入顺序稳定——与创建相同的 CP-SAT 固定种子、单线程与
+  字典序规范化保证结果确定，且**不依赖请求列表的排列顺序**。
+- **只读**：不改动、不删除已存储方案，也不落库任何结果。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/rollback-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"deployed_services": ["web", "api", "auth", "db", "cache"]}'
+```
+
+承接上面 `payment-platform` 示例（存储发布波次为
+`[db] → [auth] → [api] → [cache, web]`），全部上线时回滚波次恰好是发布的逆序：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "deployed_services": ["api", "auth", "cache", "db", "web"],
+  "waves": [
+    {"index": 1, "services": ["web"]},
+    {"index": 2, "services": ["api"]},
+    {"index": 3, "services": ["auth", "cache"]},
+    {"index": 4, "services": ["db"]}
+  ],
+  "wave_count": 4,
+  "max_concurrency": 2,
+  "optimal": true
+}
+```
+
+如果当时只上线到 `db`、`auth`、`api`（`cache`、`web` 未上线），只需
+`{"deployed_services": ["db", "auth", "api"]}`，得到
+`[api] → [auth] → [db]` 三个回滚波，未上线的服务不会出现。`deployed_services`
+传空数组是合法请求，返回 0 个波次。
+
+**依赖闭包校验**：上线集合必须满足依赖闭包——一个已上线服务的所有前置（直接
+依赖）也必须已上线；否则返回 **422**，并为每个违反闭包的服务给出一条 issue，
+精确定位到缺失的前置服务。例如只上报 `api` 已上线，但其前置 `auth`、`db` 缺失：
+
+```json
+{
+  "error": "planning_failed",
+  "message": "The deployed services violate dependency closure: ...",
+  "issues": [
+    {
+      "code": "rollback_prerequisite_not_deployed",
+      "message": "Deployed service 'api' requires prerequisite service(s) 'auth' and 'db' to also be deployed, but they are not reported as live; the deployed set is not dependency-closed.",
+      "constraint": "deployed_services",
+      "service": "api",
+      "related_services": ["auth", "db"],
+      "context": {"missing_prerequisites": ["auth", "db"]}
+    }
+  ]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `deployed_services` | 回显已排序、去重后的上线服务（回滚只覆盖这些服务） |
+| `waves` / `wave_count` | 各回滚波（1 起始，波内服务按 id 排序）及总波数 |
+| `max_concurrency` | 继承自原方案的每波并发上限 |
+| `optimal` | `true` 表示求解器证明了波次最少 |
+
+此外，引用不属于本方案的服务返回 422 `unknown_service`，同一服务在请求中重复
+出现返回 422 `duplicate_service`，方案不存在返回 404。
+
+## 实际执行时间线审计（POST /plans/{id}/timeline-audit）
+
+发布结束后，把方案内**每个服务唯一的实际起止时间**（ISO 8601，含时区偏移；
+不带时区的时间按 UTC 解释）发给本接口。服务严格按照**已存储的波次方案与依赖
+DAG**（不会被审计修改）校验实际启动顺序，并计算实际耗时指标：
+
+- **前一波屏障（previous_wave）**：波次 N 的每个服务必须在**波次 N−1 的全部
+  服务都完成之后**才能启动；违规的约束对象记为 `"wave N"`，`blocking_service`
+  为前一波最晚结束的那个服务。
+- **直接依赖（dependency）**：每个服务必须在它**直接依赖的每个服务**完成之后
+  才能启动；每条未满足的依赖边单独报告一条违规，约束对象即前置服务 id。
+- **重叠毫秒数（overlap_ms）**：服务提前于约束满足时刻启动的毫秒数；启动时刻
+  与前置完成时刻**恰好相等视为合法**（0 重叠不算违规）。
+
+合法输入（覆盖完整、无重复、无未知服务、无时间倒置）下还会返回：每个服务的
+实际耗时、每个波从最早启动到最晚结束的实际耗时、整体最早启动到最晚结束的总耗时，
+以及在依赖 DAG 上**以各服务实际耗时为权值的总耗时最长路径——关键链**
+（`critical_chain`，前置在前；等长时按服务 id 字典序取最小链，结果确定）。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/timeline-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "service_timelines": [
+      {"service": "db",    "started_at": "2026-09-22T10:00:00Z", "finished_at": "2026-09-22T10:00:30Z"},
+      {"service": "auth",  "started_at": "2026-09-22T10:00:30Z", "finished_at": "2026-09-22T10:01:30Z"},
+      {"service": "api",   "started_at": "2026-09-22T10:01:30Z", "finished_at": "2026-09-22T10:02:00Z"},
+      {"service": "cache", "started_at": "2026-09-22T10:02:00Z", "finished_at": "2026-09-22T10:02:10Z"},
+      {"service": "web",   "started_at": "2026-09-22T10:02:00Z", "finished_at": "2026-09-22T10:02:20Z"}
+    ]
+  }'
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`），完全合规时 `valid=true`、
+`violations=[]`，关键链沿 `db → auth → api → web`（30+60+30+20=140 秒，
+等于各服务耗时之和）。若把 `web` 的 `started_at` 提前到 `10:01:56`（比 `api`
+完成早 4 秒），响应中会出现：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "valid": false,
+  "violations": [
+    {
+      "service": "web",
+      "constraint_type": "dependency",
+      "constraint": "api",
+      "blocking_service": "api",
+      "overlap_ms": 4000
+    },
+    {
+      "service": "web",
+      "constraint_type": "previous_wave",
+      "constraint": "wave 3",
+      "blocking_service": "api",
+      "overlap_ms": 4000
+    }
+  ],
+  "service_timings": {
+    "api": {"started_at": "2026-09-22T10:01:30Z", "finished_at": "2026-09-22T10:02:00Z", "duration_ms": 30000}
+  },
+  "waves": [
+    {"index": 1, "started_at": "2026-09-22T10:00:00Z", "finished_at": "2026-09-22T10:00:30Z", "duration_ms": 30000, "services": ["db"]}
+  ],
+  "critical_chain": {
+    "services": ["db", "auth", "api", "web"],
+    "duration_ms": 140000
+  },
+  "total_duration_ms": 144000
+}
+```
+
+（关键链耗时只累加各服务自身时长，与启动时刻无关，故仍为 140000；
+`total_duration_ms` 是墙上时钟跨度，提前启动使其变为 144000。）
+
+> 由于每条依赖边的两端必处于不同波次，满足全部波次屏障即自动满足全部依赖；
+> 依赖违规因此总会与对应的前一波屏障违规同时出现。两类违规仍分别报告：
+> 波次屏障给出「上一波整体未完成」的聚合约束，依赖违规逐条给出具体前置服务
+> （一个服务同时有多个未完成直接依赖时，每个前置各一条）。
+
+| 字段 | 含义 |
+| --- | --- |
+| `valid` | 无任何波次/依赖违规时为 `true` |
+| `violations[]` | 每条违规含违规服务 `service`、约束类型 `constraint_type`、约束对象 `constraint`（`"wave N"` 或前置服务 id）、具体阻塞服务 `blocking_service` 与 `overlap_ms`；按服务、类型、约束对象确定排序 |
+| `service_timings` | 每个服务规范化（统一转 UTC）后的起止时间与耗时毫秒 |
+| `waves[]` | 各存储波次的实际起止（波内最早启动、最晚结束）与实际耗时，按波次顺序 |
+| `critical_chain` | 依赖 DAG 上按服务实际耗时加权的最长路径（前置在前）及链上耗时之和 |
+| `total_duration_ms` | 全部服务最早启动到最晚结束的整体耗时 |
+
+时间线请求本身做覆盖与一致性校验，冲突时统一返回 **422**（信封同下）：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `missing_service_timeline` | 方案中的某个服务没有上报时间窗口 |
+| `duplicate_service_timeline` | 同一服务出现多条时间窗口 |
+| `unknown_service` | 上报了不属于本方案的服务 |
+| `timeline_inverted` | 某服务的 `finished_at` 早于 `started_at`（context 附两个时间） |
+
+起止时间缺失、不是合法 ISO 8601、`service_timelines` 为空或为空对象等
+schema 问题返回 `validation_error`。零时长窗口（`started_at == finished_at`）
+合法。审计为只读操作：重复请求得到相同结果（且与请求列表顺序无关），
+方案不存在返回 404。
+
+## 责任域（服务归属）审计（POST /plans/{id}/ownership-audit）
+
+把方案内服务归属到负责团队（`ownership`：服务 → 团队的映射），并声明每个团队在
+**同一波次内同时值班的服务数上限**（`team_oncall_caps`），服务沿**已存储的依赖图、
+波次方案与故障域**（审计不会修改它们）把责任投影到团队：
+
+- **跨团队依赖链（cross_team_dependencies）**：逐条列出两端都有负责人、但分属不同
+  团队的依赖边（下游服务/下游团队 → 前置服务/前置团队）。
+- **协同顺序（coordination_order）**：把服务依赖图沿团队压缩成团队商图后，按
+  **依赖拓扑（Kahn）**给出需要协同的团队顺序——被依赖的团队（前置提供方）在前；
+  多个团队同时就绪时按团队 id 字典序打破平局。只出现参与跨团队依赖的团队。
+- **无负责人服务（unowned_services）**：映射**允许不覆盖**全部服务，未出现的服务
+  作为审计发现返回（不是错误）；涉及无负责人服务的依赖边不计入跨团队依赖。
+- **故障域团队耦合（fault_domain_coupling）**：逐个故障域给出其中成员所属的团队；
+  当一个故障域内存在 **≥2 个不同团队**的成员时 `coupled=true`，即该故障域一旦
+  故障会同时打击多个团队。成员全部无归属或只属于一个团队时 `coupled=false`。
+- **每团队负责服务数与超限（teams）**：每个团队负责的服务数、服务列表（排序）、
+  值班上限，以及在**哪些已存波次**中该团队同时值班的服务数超过上限
+  （`overlimit`：波次、同波服务、超出数 `over_by`）。
+
+所有列表都**稳定排序**（团队/服务按 id、故障域按存储顺序、波次按序），结果与请求
+列表的排列顺序无关。**只读不落库**。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/ownership-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ownership": [
+      {"service": "db",    "team": "data"},
+      {"service": "auth",  "team": "backend"},
+      {"service": "api",   "team": "backend"},
+      {"service": "cache", "team": "edge"},
+      {"service": "web",   "team": "edge"}
+    ],
+    "team_oncall_caps": {"data": 1, "backend": 1, "edge": 1}
+  }'
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`，`db`/`cache` 同属故障域 `az-a`），
+`edge` 团队的 `cache`、`web` 在第 4 波同时值班，超过其上限 1：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "teams": [
+    {"team": "backend", "service_count": 2, "services": ["api", "auth"], "oncall_cap": 1, "overlimit": []},
+    {"team": "data",    "service_count": 1, "services": ["db"],          "oncall_cap": 1, "overlimit": []},
+    {
+      "team": "edge",
+      "service_count": 2,
+      "services": ["cache", "web"],
+      "oncall_cap": 1,
+      "overlimit": [
+        {"team": "edge", "wave": 4, "services": ["cache", "web"], "service_count": 2, "oncall_cap": 1, "over_by": 1}
+      ]
+    }
+  ],
+  "unowned_services": [],
+  "cross_team_dependencies": [
+    {"service": "api",  "service_team": "backend", "depends_on": "db", "depends_on_team": "data"},
+    {"service": "auth", "service_team": "backend", "depends_on": "db", "depends_on_team": "data"},
+    {"service": "web",  "service_team": "edge",    "depends_on": "api", "depends_on_team": "backend"}
+  ],
+  "coordination_order": ["data", "backend", "edge"],
+  "fault_domain_coupling": [
+    {"domain": "az-a", "teams": ["data", "edge"], "services": ["cache", "db"], "coupled": true}
+  ]
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `teams[]` | 每个团队负责服务数、服务列表、值班上限与超限波次，按团队 id 排序 |
+| `teams[].overlimit[]` | 该团队同时值班服务数超过上限的已存波次（1 起始）：同波服务、`service_count`、`oncall_cap` 与超出数 `over_by` |
+| `unowned_services` | 映射未覆盖的方案服务（审计发现，非错误），按 id 排序 |
+| `cross_team_dependencies[]` | 两端都有负责人且跨团队的依赖边，按下游服务/前置服务排序 |
+| `coordination_order` | 参与跨团队依赖的团队按依赖拓扑的协同顺序（前置团队在前，字典序平局） |
+| `fault_domain_coupling[]` | 每个已存故障域涉及的团队、成员及 `coupled`（≥2 个团队为 true） |
+
+请求本身做结构校验，冲突时统一返回**结构化 422**（信封同下）；**计划不存在也返回
+结构化 422**（issue code 仍为 `plan_not_found`，与其他接口的同 code 一致，仅 HTTP
+状态码按本接口约定为 422）：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `plan_not_found` | 方案不存在（`constraint=plan_id`，context 带 id） |
+| `unknown_service` | 映射引用了不属于本方案的服务（`constraint=ownership`） |
+| `duplicate_service_owner` | 同一服务在映射中出现多次（context 给出涉及的团队） |
+| `missing_service_owner` | 某条映射的 `team` 为空串/纯空白，即该服务缺少负责人 |
+| `team_oncall_cap_missing` | 某团队拥有服务，但 `team_oncall_caps` 未声明其上限 |
+
+值班上限为 0、负数、非整数或 `ownership` 结构不合法等 schema 问题返回
+`validation_error`（`invalid_request_field`）。`ownership` 为空数组是合法请求，
+此时全部服务都是 `unowned_services`。审计为只读操作：重复请求得到相同结果（且与
+请求列表顺序无关），不改动已存储方案。
+
+## 服务松弛度报告（GET /plans/{id}/slack-report）
+
+对**已存储的最优波次方案**做只读的波次级松弛度（float）分析：在**总波次数不增加**
+（波次上界固定为当前方案的最少波数）且仍满足全部**依赖顺序、每波并发上限与故障域
+反亲和**约束的前提下，求每个服务最晚可以放到第几波；它与当前波次的差
+`slack_waves` 就是该服务能**向后（更晚）移动的最大波数**。
+
+- 求解复用规划时的同一套 CP-SAT 波次模型与确定性设置（固定随机种子、单搜索线程）：
+  逐服务把波次上界锁死为当前波数后最大化该服务的波次，每个服务一次小求解
+  （以当前方案作为初始可行解），相同方案永远得到相同报告。
+- `slack_waves == 0` 的服务即**零松弛关键服务**：它在当前方案里已经无处可后移，
+  延迟它就必须增加波次或违反约束。
+- 每个关键服务还给出 `constrained_downstream`：沿**存储方案中恰好相差一波**的
+  依赖边（「紧」边）可达、且自身同样零松弛的下游服务——即受该关键服务约束的
+  关键链延续。只有依赖边参与这一关联；仅共享故障域（反亲和、无依赖关系）的服务
+  不会出现在彼此的下游列表中，但故障域约束仍参与每个服务松弛度的计算。
+- **只读不落库**：不改动、不删除已存储方案，也不缓存任何结果。
+
+```bash
+curl http://localhost:8000/plans/1/slack-report
+```
+
+承接上面 `payment-platform` 示例（存储波次为
+`[db] → [auth] → [api] → [cache, web]`，4 波已为最少），链上每个服务都无法后移，
+全部为零松弛关键服务；`cache` 虽在最后一波（同样零松弛），但它与 `db` 只有故障域
+关系、没有依赖边，因此不属于 `db` 的约束下游：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "wave_count": 4,
+  "optimal": true,
+  "services": [
+    {"service": "api",   "wave": 3, "latest_wave": 3, "slack_waves": 0},
+    {"service": "auth",  "wave": 2, "latest_wave": 2, "slack_waves": 0},
+    {"service": "cache", "wave": 4, "latest_wave": 4, "slack_waves": 0},
+    {"service": "db",    "wave": 1, "latest_wave": 1, "slack_waves": 0},
+    {"service": "web",   "wave": 4, "latest_wave": 4, "slack_waves": 0}
+  ],
+  "critical_services": [
+    {"service": "api",   "wave": 3, "constrained_downstream": ["web"]},
+    {"service": "auth",  "wave": 2, "constrained_downstream": ["api", "web"]},
+    {"service": "cache", "wave": 4, "constrained_downstream": []},
+    {"service": "db",    "wave": 1, "constrained_downstream": ["api", "auth", "web"]},
+    {"service": "web",   "wave": 4, "constrained_downstream": []}
+  ]
+}
+```
+
+存在非零松弛的例子：4 个**互相无依赖**的服务、每波并发上限 2 时，方案为
+`[a, b] → [c, d]`；`a`、`b` 各自都可以挪到第 2 波（给本波腾出容量），
+`slack_waves=1`，而最后一波的 `c`、`d` 无处可移：
+
+```json
+{
+  "plan_id": 2,
+  "wave_count": 2,
+  "optimal": true,
+  "services": [
+    {"service": "a", "wave": 1, "latest_wave": 2, "slack_waves": 1},
+    {"service": "b", "wave": 1, "latest_wave": 2, "slack_waves": 1},
+    {"service": "c", "wave": 2, "latest_wave": 2, "slack_waves": 0},
+    {"service": "d", "wave": 2, "latest_wave": 2, "slack_waves": 0}
+  ],
+  "critical_services": [
+    {"service": "c", "wave": 2, "constrained_downstream": []},
+    {"service": "d", "wave": 2, "constrained_downstream": []}
+  ]
+}
+```
+
+注意一个细节：紧边只覆盖「差一波」的直接依赖，且下游自身必须零松弛才会被列入。
+例如链式 `a → b → c`（cap 2，另有独立服务 d、e 时）方案为 `[a] → [b, d] → [c, e]`，
+`d` 虽是 `a` 的紧下游但它有 1 波松弛，因此不计入 `a` 的 `constrained_downstream`；
+只有零松弛的 `b`、`c` 计入。
+
+| 字段 | 含义 |
+| --- | --- |
+| `wave_count` | 当前存储方案的波次数（分析期间保持不变） |
+| `services[].wave` / `latest_wave` | 服务当前所在波 / 不加波时可到的最晚波（1 起始，按服务 id 排序） |
+| `services[].slack_waves` | `latest_wave - wave`，可向后移动的最大波数；0 表示关键服务 |
+| `critical_services[].constrained_downstream` | 沿恰好相差一波的依赖边可达的零松弛下游（关键链延续），已排序 |
+| `optimal` | 每个服务的最晚波都被求解器证明为最优时为 `true`；触发求解时间上限时为 `false`，此时个别 `slack_waves` 可能是保守下界 |
+
+松弛度报告为只读操作：重复请求得到相同结果（确定性），方案不存在返回与其它接口
+一致的 404（`not_found` / `plan_not_found`）。归档导入（`POST /plans/import`）
+恢复出的方案同样可以分析，报告针对其原样保留的波次计算。
+
+## 离线归档导出（GET /plans/{id}/bundle）
+
+把一个已存方案导出为**离线归档包（bundle）**，可跨实例搬运或存档。归档为只读
+操作，不改动方案、不落库任何导出痕迹。响应信封三部分：
+
+- `bundle.request`：规范化（服务/依赖/故障域固定排序）的**请求约束**；
+- `bundle.result`：归档时的**求解结果**——逐波服务、波数、`optimal` 以及约束回显，
+  导入时**原样写入、绝不重新求解**，因此波次结果在迁移后完全不变；
+- `bundle.meta`：**版本元数据**——归档格式 `release-wave-plan-bundle`、
+  格式版本 `1.0`、导出服务名与版本；
+- `provenance`：实例相关的溯源信息（源方案 id、原方案创建时间、导出时间），
+  **不参与摘要**，因此同一方案在不同实例/不同时刻导出得到相同摘要；
+- `sha256`：仅对 `bundle` 对象的**规范 JSON**
+  （`json.dumps(..., sort_keys=True, ensure_ascii=False, separators=(",", ":"))`，
+  UTF-8）计算的 SHA-256。摘要只取决于方案内容，与线上传输时的空白、键序无关。
+
+```bash
+curl http://localhost:8000/plans/1/bundle
+```
+
+响应（节选）：
+
+```json
+{
+  "sha256": "beea9b9feac1d2dc…",
+  "bundle": {
+    "request": {
+      "name": "payment-platform",
+      "services": ["api", "auth", "cache", "db", "web"],
+      "dependencies": [
+        {"service": "api", "depends_on": "auth"},
+        {"service": "api", "depends_on": "db"},
+        {"service": "auth", "depends_on": "db"},
+        {"service": "web", "depends_on": "api"}
+      ],
+      "max_concurrency": 2,
+      "fault_domains": [{"domain": "az-a", "services": ["cache", "db"]}],
+      "max_waves": null
+    },
+    "result": {
+      "services": ["api", "auth", "cache", "db", "web"],
+      "waves": [
+        {"index": 1, "services": ["db"]},
+        {"index": 2, "services": ["auth"]},
+        {"index": 3, "services": ["api"]},
+        {"index": 4, "services": ["cache", "web"]}
+      ],
+      "max_concurrency": 2,
+      "max_waves": null,
+      "dependencies": [ … ],
+      "fault_domains": [ … ],
+      "optimal": true
+    },
+    "meta": {
+      "format": "release-wave-plan-bundle",
+      "format_version": "1.0",
+      "service": {"name": "release-wave-planner", "version": "1.5.0"}
+    }
+  },
+  "provenance": {
+    "source_plan_id": 1,
+    "created_at": "2026-09-22T10:00:00Z",
+    "exported_at": "2026-09-22T12:00:00Z"
+  }
+}
+```
+
+## 离线归档导入（POST /plans/import）
+
+把 `GET /plans/{id}/bundle` 的响应**原样** POST 回本接口（或另一个实例）即可
+恢复方案。导入严格按以下顺序校验，**任何一步失败都零写入**（不产生方案记录、
+不留半成品）：
+
+1. **摘要**：按相同的规范 JSON 重新计算 `bundle` 的 SHA-256，必须与请求中的
+   `sha256` 一致——检测传输损坏或归档被篡改（`bundle_checksum_mismatch`，
+   回传 `declared` 与实际值 `actual`）；
+2. **格式/版本**：`meta.format == "release-wave-plan-bundle"` 且
+   `format_version == "1.0"`（`bundle_format_unsupported`）；
+3. **Schema**：pydantic 严格模型（未知字段即拒绝），失败统一 422
+   `validation_error`；
+4. **依赖/故障域引用**：复用建方案时的同一套校验——重复声明、
+   依赖两端与故障域成员必须属于本归档服务集合（`unknown_dependency_*`、
+   `unknown_fault_domain_member`、`duplicate_*`）；依赖图必须是 DAG
+   （`dependency_cycle`，给出具体环）；
+5. **结果一致性**：归档波次必须真正求解了归档请求——索引自 1 起连续、
+   每个服务恰好出现一次、依赖必须严格处于更早波次、每波服务数不超过
+   `max_concurrency`、同故障域成员不同波、波数不超过 `max_waves`
+   （统一 issue code `bundle_result_inconsistent`，逐条可定位）。
+
+校验全部通过后，在**单个事务**内写入一行新方案（新自增 id、新的本地创建时间，
+不采用 `provenance` 中的源 id/时间），`bundle_sha256` 随方案落库。波次结果
+**直接复制归档内容，不调用求解器**，所以恢复出的方案与源方案的波次完全一致。
+
+```bash
+curl -X POST http://localhost:8000/plans/import \
+  -H 'Content-Type: application/json' \
+  --data @bundle.json
+```
+
+首次导入返回 **201**，响应体与 `GET /plans/{id}` 相同，另带摘要与 `reused` 标志：
+
+```json
+{
+  "id": 2,
+  "name": "payment-platform",
+  "waves": [ … ],
+  "wave_count": 4,
+  "optimal": true,
+  "created_at": "2026-09-22T12:05:00+00:00",
+  "sha256": "beea9b9feac1d2dc…",
+  "reused": false
+}
+```
+
+**幂等**：同一摘要再次导入（或两个请求并发导入同一归档）不会产生第二行，
+而是返回 **200** 与既有方案，`reused=true`。摘要不同（方案内容真的不同）
+才会写入新方案；删除既有方案后重新导入同一摘要则会生成一条新记录。
+
+| 字段 | 含义 |
+| --- | --- |
+| `sha256` | 导入所依据的归档摘要，随方案持久化（幂等键） |
+| `reused` | `true` 表示该摘要已存在、直接返回既有方案；`false` 表示本次新建 |
+
+导入失败的 422 信封与其它接口一致。典型 issue：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `bundle_checksum_mismatch` | 声明的 SHA-256 与规范 JSON 实算不符（损坏/篡改） |
+| `bundle_format_unsupported` | 归档格式或格式版本不受支持 |
+| `bundle_result_inconsistent` | 归档波次违反归档请求（依赖顺序/并发/故障域/发布窗口/覆盖不完整等） |
+| `dependency_cycle` / `unknown_dependency_*` / `unknown_fault_domain_member` / `duplicate_*` | 归档请求的引用与结构问题（同建方案语义） |
+
+> 摘要只能证明「字节与某份文档一致」，不能证明文档本身是一个可行方案；因此
+> 即使攻击者修改后重新计算摘要（通过第 1 步），第 5 步的结果一致性校验仍会
+> 拒绝自相矛盾的归档。导入接口不依赖求解器，恢复大方案也很快。
+
+## 错误结构（422）
+
+所有失败使用统一信封 `error + message + issues[]`，每个 issue 可定位：
+
+```json
+{
+  "error": "planning_failed",
+  "message": "The dependency graph contains a cycle.",
+  "issues": [
+    {
+      "code": "dependency_cycle",
+      "message": "... First cycle: x -> y -> x",
+      "constraint": "dependencies",
+      "service": "x",
+      "related_services": ["x", "y"],
+      "context": {"cycles": [["x", "y"]], "cycle_count": 1}
+    }
+  ]
+}
+```
+
+| issue code | 定位的问题 |
+| --- | --- |
+| `dependency_cycle` | 依赖成环（含自依赖），给出具体环路径 |
+| `unknown_dependency_service` / `unknown_dependency_target` | 依赖引用了不存在的服务 |
+| `unknown_fault_domain_member` / `duplicate_*` | 故障域引用未知服务或重复声明 |
+| `dependency_chain_too_long` | 最长依赖链所需波次超过 `max_waves`（给出关键路径） |
+| `concurrency_cap_too_low` | `ceil(服务数 / 并发上限)` 超过 `max_waves` |
+| `fault_domain_anti_affinity` | 故障域反亲和所需的最少波次超过 `max_waves` |
+| `release_window_infeasible` | 组合约束下窗口不可行，附无窗口时所需的确切波次 |
+| `dependency_not_found` / `fault_domain_not_found` | 模拟请求要求删除不存在的依赖/故障域 |
+| `dependency_failed` / `upstream_failure` / `dependency_incomplete` | 门禁阻塞原因：直接依赖失败 / 依赖被上游失败递归阻塞（附失败根因）/ 依赖尚未完成 |
+| `unknown_service` / `duplicate_service_status` / `service_status_conflict` | 门禁或回滚预览上报了未知服务；门禁中同一状态重复上报或完成/失败状态冲突 |
+| `completed_with_failed_dependency` / `completed_before_dependencies` | 门禁上报的「已完成」与其失败上游或未完成依赖矛盾 |
+| `rollback_prerequisite_not_deployed` | 回滚预览的上线集合违反依赖闭包：已上线服务的某个前置未上线（附缺失前置） |
+| `duplicate_service` | 回滚预览请求中同一服务重复出现 |
+| `missing_service_timeline` / `duplicate_service_timeline` | 时间线审计：方案服务缺失时间窗口 / 同一服务出现多条窗口 |
+| `timeline_inverted` | 时间线审计：某服务 `finished_at` 早于 `started_at` |
+| `unknown_service` / `duplicate_service_owner` / `missing_service_owner` | 责任域审计：映射引用未知服务 / 同一服务映射多次 / 某条映射团队为空（`ownership`） |
+| `team_oncall_cap_missing` | 责任域审计：拥有服务的团队缺少 `team_oncall_caps` 值班上限声明 |
+| `bundle_checksum_mismatch` | 归档导入：声明的 SHA-256 与规范 JSON 实算不符（附 `declared`/`actual`） |
+| `bundle_format_unsupported` | 归档导入：归档格式或格式版本不受支持 |
+| `bundle_result_inconsistent` | 归档导入：归档波次不满足归档请求（依赖顺序/并发/故障域/窗口/覆盖不完整） |
+| `invalid_request_field` | JSON/Schema 校验失败，附带字段位置 |
+
+## API 一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/plans` | 提交并生成方案，成功 201，失败 422（结构化原因） |
+| POST | `/plans/{id}/simulate` | 约束变更影响模拟（不落库）：新波次、波次增减、逐服务新旧波次、受影响服务 |
+| POST | `/plans/{id}/gate` | 执行门禁（只读）：上报已完成/失败服务，返回最早可执行波次、可执行与阻塞服务及每项可定位原因；输入冲突统一 422 |
+| POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
+| POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：逐服务上报实际起止时间，校验前一波屏障与直接依赖，返回每条违规（服务/约束对象/阻塞服务/重叠毫秒）、各波实际耗时与按服务耗时加权的依赖 DAG 关键链；覆盖缺失、重复、时间倒置或未知服务 422 |
+| POST | `/plans/{id}/ownership-audit` | 责任域审计（只读）：服务 → 团队映射 + 每团队同时值班上限，返回跨团队依赖链、依赖拓扑协同团队顺序、无负责人服务、每团队负责服务数与超限波次、故障域团队耦合；计划不存在/未知或重复服务/缺少负责人/团队上限非法均为结构化 422 |
+| GET | `/plans/{id}/slack-report` | 服务松弛度报告（只读）：用同一确定性求解器求每个服务在不加波且满足依赖/并发/故障域约束下最晚可到的波次与可后移波数，列出零松弛关键服务及其紧依赖零松弛下游；方案不存在 404 |
+| GET | `/plans/{id}/bundle` | 离线归档导出（只读）：规范 JSON 的请求约束 + 求解结果 + 版本元数据，附 `sha256` 与溯源信息；方案不存在 404 |
+| POST | `/plans/import` | 离线归档导入：先校验摘要、格式/schema、依赖/故障域引用与结果一致性，再事务写入新方案（波次原样保留、不重新求解）；新方案 201，重复摘要幂等 200（`reused=true`），任何校验失败 422 且零写入 |
+| GET | `/plans?limit=50&offset=0` | 方案列表（按 id 倒序分页） |
+| GET | `/plans/{id}` | 查询单个方案（含完整波次与原始约束） |
+| DELETE | `/plans/{id}` | 删除方案，成功 200，不存在 404 |
+| GET | `/health` | 健康检查 |
+
+## 必要配置（环境变量，均有默认值）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PLANNER_DB_PATH` | `./data/plans.db`（容器内为 `/data/plans.db`） | SQLite 文件路径，目录自动创建 |
+| `PLANNER_SOLVER_TIME_LIMIT` | `10` | 每个求解阶段的时间上限（秒） |
+| `PLANNER_SOLVER_WORKERS` | `1` | CP-SAT 搜索线程数（1 保证确定性） |
+| `PLANNER_PORT`（仅 compose） | `8000` | 宿主机映射端口 |
+
+数据存储在 compose 命名卷 `planner-data`（容器内 `/data`），重启不丢记录。
+数据库表在**每次启动时**通过 `CREATE TABLE IF NOT EXISTS` 自动创建，无需手工迁移。
+
+## 本地开发（不用 Docker）
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+默认零配置本地运行：SQLite 自动建在 `./data/plans.db`（目录会自动创建，
+已在 `.gitignore` 中忽略）；如需自定义路径再设置 `PLANNER_DB_PATH`。
+
+运行测试（额外需要 pytest、httpx）：
+
+```bash
+pip install -r requirements.txt pytest httpx
+python3 -m pytest -q
+```
+
+## 项目结构
+
+```
+app/
+  config.py     # 环境变量配置
+  schemas.py    # 请求/响应模型与错误结构
+  errors.py     # 结构化规划异常
+  graph.py      # 依赖图：环检测（Tarjan SCC）、关键路径
+  planner.py    # CP-SAT 建模、两阶段求解、变更模拟、不可行诊断
+  gate.py       # 执行门禁：逐波可执行判定、失败递归传播、进度一致性校验
+  rollback.py   # 回滚预览：上线集合依赖闭包校验、反向边回滚波次生成
+  audit.py      # 执行时间线审计：波次/依赖顺序校验、违规重叠毫秒、实际耗时与加权关键链
+  ownership.py  # 责任域审计：跨团队依赖、拓扑协同顺序、无负责人服务、值班超限与故障域团队耦合
+  slack.py      # 服务松弛度：固定波次上界下逐服务最大化波次、零松弛关键服务与紧依赖下游
+  bundle.py     # 离线归档：规范 JSON/SHA-256、导出组装、导入校验（摘要/schema/引用/结果一致性）
+  db.py         # SQLite 初始化与 CRUD（含 bundle_sha256 幂等键与事务导入）
+  main.py       # FastAPI 路由、启动建表、异常处理
+tests/          # 端到端测试（规划/错误定位/CRUD/模拟/门禁/回滚预览/时间线审计/松弛度/归档/确定性）
+Dockerfile
+docker-compose.yml
+requirements.txt
+```

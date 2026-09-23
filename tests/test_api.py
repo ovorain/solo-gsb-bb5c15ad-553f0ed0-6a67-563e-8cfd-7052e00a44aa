@@ -1,0 +1,2160 @@
+"""End-to-end tests covering planning, error localization and persistence."""
+from __future__ import annotations
+
+import os
+import tempfile
+
+import pytest
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture()
+def client(monkeypatch):
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    monkeypatch.setenv("PLANNER_DB_PATH", tmp.name)
+    monkeypatch.setenv("PLANNER_SOLVER_TIME_LIMIT", "5")
+    from importlib import reload
+
+    from app import config, db, main
+
+    reload(config)
+    settings = config.load_settings()
+    main.app.state.settings = settings
+    db.init_db(settings.database_path)
+
+    with TestClient(main.app) as c:
+        yield c
+
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.unlink(tmp.name + suffix)
+        except OSError:
+            pass
+
+
+BASE_PAYLOAD = {
+    "services": ["a", "b", "c", "d"],
+    "dependencies": [
+        {"service": "b", "depends_on": "a"},
+        {"service": "c", "depends_on": "a"},
+        {"service": "d", "depends_on": "b"},
+        {"service": "d", "depends_on": "c"},
+    ],
+    "max_concurrency": 4,
+}
+
+
+def test_minimum_waves_with_dependencies(client):
+    r = client.post("/plans", json=BASE_PAYLOAD)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b", "c"], ["d"]]
+    assert [w["index"] for w in body["waves"]] == [1, 2, 3]
+    assert body["optimal"] is True
+
+
+def test_concurrency_cap_spreads_services(client):
+    payload = {"services": ["a", "b", "c", "d"], "dependencies": [], "max_concurrency": 2}
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert all(len(w["services"]) <= 2 for w in body["waves"])
+
+
+def test_fault_domain_members_split_across_waves(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b", "c"]}],
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    placement = {s: w["index"] for w in body["waves"] for s in w["services"]}
+    assert len({placement["a"], placement["b"], placement["c"]}) == 3
+
+
+def test_dependency_cycle_is_localized(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "a", "depends_on": "b"},
+            {"service": "b", "depends_on": "c"},
+            {"service": "c", "depends_on": "a"},
+        ],
+        "max_concurrency": 2,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "dependency_cycle"
+    assert issue["constraint"] == "dependencies"
+    assert set(issue["related_services"]) == {"a", "b", "c"}
+    assert issue["context"]["cycle_count"] >= 1
+
+
+def test_self_dependency_is_a_cycle(client):
+    payload = {
+        "services": ["a"],
+        "dependencies": [{"service": "a", "depends_on": "a"}],
+        "max_concurrency": 1,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    assert r.json()["issues"][0]["code"] == "dependency_cycle"
+
+
+def test_unknown_dependency_reference(client):
+    payload = {
+        "services": ["a"],
+        "dependencies": [{"service": "a", "depends_on": "ghost"}],
+        "max_concurrency": 1,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "unknown_dependency_target" in codes
+    issue = next(i for i in r.json()["issues"] if i["code"] == "unknown_dependency_target")
+    assert issue["service"] == "ghost"
+    assert issue["related_services"] == ["a"]
+
+
+def test_max_waves_dependency_chain_reason(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 3,
+        "max_waves": 2,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "dependency_chain_too_long" in codes
+    issue = next(i for i in r.json()["issues"] if i["code"] == "dependency_chain_too_long")
+    assert issue["context"]["required_waves"] == 3
+    assert set(issue["related_services"]) == {"a", "b", "c"}
+
+
+def test_max_waves_capacity_reason(client):
+    payload = {
+        "services": ["a", "b", "c", "d"],
+        "dependencies": [],
+        "max_concurrency": 1,
+        "max_waves": 2,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "concurrency_cap_too_low" in codes
+
+
+def test_max_waves_fault_domain_reason(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "fd", "services": ["a", "b", "c"]}],
+        "max_waves": 2,
+    }
+    r = client.post("/plans", json=payload)
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "fault_domain_anti_affinity" in codes
+
+
+def test_plans_are_deterministic(client):
+    responses = [client.post("/plans", json=BASE_PAYLOAD).json() for _ in range(3)]
+    waves = [body["waves"] for body in responses]
+    assert waves[0] == waves[1] == waves[2]
+
+
+def test_list_get_delete_lifecycle(client):
+    created = client.post("/plans", json=BASE_PAYLOAD).json()
+    pid = created["id"]
+
+    listing = client.get("/plans").json()
+    assert listing["total"] >= 1
+    assert any(item["id"] == pid for item in listing["items"])
+
+    fetched = client.get(f"/plans/{pid}")
+    assert fetched.status_code == 200
+    assert fetched.json()["waves"] == created["waves"]
+
+    missing = client.get("/plans/9999")
+    assert missing.status_code == 404
+    assert missing.json()["error"] == "not_found"
+
+    deleted = client.delete(f"/plans/{pid}")
+    assert deleted.status_code == 200
+    assert deleted.json()["deleted"] is True
+
+    assert client.get(f"/plans/{pid}").status_code == 404
+    assert client.delete(f"/plans/{pid}").status_code == 404
+
+
+def test_health(client):
+    assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_schema_validation_error_envelope(client):
+    r = client.post(
+        "/plans",
+        json={"services": ["a"], "dependencies": [], "max_concurrency": 0},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/simulate
+# ---------------------------------------------------------------------------
+
+
+def _create_plan(client, payload=None):
+    r = client.post("/plans", json=payload or BASE_PAYLOAD)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_simulate_no_changes_reproduces_plan(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["waves"] == plan["waves"]
+    assert body["wave_count"] == plan["wave_count"] == 3
+    assert body["original_wave_count"] == 3
+    assert body["wave_delta"] == 0
+    assert body["max_concurrency"] == plan["max_concurrency"]
+    assert body["optimal"] is True
+    assert body["moved_services"] == []
+    assert body["affected_services"] == []
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert by_service.keys() == {"a", "b", "c", "d"}
+    assert all(a["from_wave"] == a["to_wave"] for a in by_service.values())
+
+
+def test_simulate_stricter_concurrency_adds_wave(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 1})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 4
+    assert body["wave_delta"] == 1
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"], ["c"], ["d"]]
+    assert body["moved_services"] == ["c", "d"]
+    assert body["max_concurrency"] == 1
+
+
+def test_simulate_looser_concurrency_removes_wave(client):
+    payload = dict(BASE_PAYLOAD, max_concurrency=1)
+    plan = _create_plan(client, payload)
+    assert plan["wave_count"] == 4
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 4})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    assert body["wave_delta"] == -1
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b", "c"], ["d"]]
+    assert body["moved_services"] == ["c", "d"]
+
+
+def test_simulate_minimizes_moved_services(client):
+    # 5 independent services, cap 2 -> [[a], [b, c], [d, e]] (3 waves).
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d", "e"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a"], ["b", "c"], ["d", "e"]]
+
+    # Cap 3 needs only 2 waves; a fresh canonical plan would be
+    # [[a, b, c], [d, e]] (3 moves), but d and e are the only services that
+    # cannot keep their wave, so exactly they must move.
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 3})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert body["wave_delta"] == -1
+    assert body["moved_services"] == ["d", "e"]
+    assert [w["services"] for w in body["waves"]] == [["a", "d"], ["b", "c", "e"]]
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert (by_service["d"]["from_wave"], by_service["d"]["to_wave"]) == (3, 1)
+    assert (by_service["e"]["from_wave"], by_service["e"]["to_wave"]) == (3, 2)
+
+
+def test_simulate_added_dependency_moves_dependent(client):
+    plan = _create_plan(client, {"services": ["a", "b"], "max_concurrency": 2})
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "b", "depends_on": "a"}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"]]
+    assert body["wave_delta"] == 1
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["a", "b"]
+    by_service = {a["service"]: a for a in body["assignments"]}
+    assert (by_service["a"]["from_wave"], by_service["a"]["to_wave"]) == (1, 1)
+    assert (by_service["b"]["from_wave"], by_service["b"]["to_wave"]) == (1, 2)
+
+
+def test_simulate_removed_dependencies_allow_fewer_waves(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={
+            "remove_dependencies": [
+                {"service": "d", "depends_on": "b"},
+                {"service": "d", "depends_on": "c"},
+            ]
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b", "c", "d"]]
+    assert body["wave_delta"] == -1
+    assert body["moved_services"] == ["d"]
+    assert body["affected_services"] == []
+
+
+def test_simulate_added_fault_domain_splits_members(client):
+    plan = _create_plan(client, {"services": ["a", "b", "c"], "max_concurrency": 3})
+    assert [w["services"] for w in plan["waves"]] == [["a", "b", "c"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-1", "services": ["a", "b"]}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a", "c"], ["b"]]
+    assert body["wave_delta"] == 1
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["a", "b"]
+
+
+def test_simulate_replace_fault_domain_via_remove_and_add(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "az-1", "services": ["a", "b"]}],
+        },
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a"], ["b", "c"]]
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={
+            "remove_fault_domains": ["az-1"],
+            "add_fault_domains": [{"domain": "az-1", "services": ["b", "c"]}],
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [w["services"] for w in body["waves"]] == [["a", "b"], ["c"]]
+    assert body["wave_delta"] == 0
+    assert body["moved_services"] == ["b"]
+    assert body["affected_services"] == ["b", "c"]
+
+
+def test_simulate_readding_existing_edge_is_noop(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "b", "depends_on": "a"}]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_delta"] == 0
+    assert body["moved_services"] == []
+    assert body["affected_services"] == []
+
+
+def test_simulate_added_dependency_cycle_is_localized(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "a", "depends_on": "d"}]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "dependency_cycle"
+    assert issue["constraint"] == "dependencies"
+    assert issue["context"]["cycle_count"] >= 1
+
+
+def test_simulate_remove_unknown_dependency(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"remove_dependencies": [{"service": "a", "depends_on": "z"}]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "dependency_not_found"
+    assert issue["constraint"] == "remove_dependencies"
+    assert issue["service"] == "a"
+    assert issue["related_services"] == ["z"]
+
+
+def test_simulate_remove_unknown_fault_domain(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"remove_fault_domains": ["nope"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "fault_domain_not_found"
+    assert issue["constraint"] == "remove_fault_domains"
+    assert issue["context"]["domain"] == "nope"
+
+
+def test_simulate_add_duplicate_fault_domain(client):
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "az-1", "services": ["a", "b"]}],
+        },
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-1", "services": ["a", "c"]}]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_fault_domain"
+    assert issue["constraint"] == "add_fault_domains"
+    assert issue["context"]["domain"] == "az-1"
+
+
+def test_simulate_unknown_references_are_localized(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_dependencies": [{"service": "a", "depends_on": "ghost"}]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "unknown_dependency_target" in codes
+
+    r = client.post(
+        f"/plans/{plan['id']}/simulate",
+        json={"add_fault_domains": [{"domain": "az-9", "services": ["a", "ghost"]}]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert "unknown_fault_domain_member" in codes
+
+
+def test_simulate_missing_plan_is_404(client):
+    r = client.post("/plans/9999/simulate", json={})
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_simulate_invalid_concurrency_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 0})
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_simulate_is_not_persisted(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+
+    r = client.post(f"/plans/{plan['id']}/simulate", json={"max_concurrency": 1})
+    assert r.status_code == 200
+
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_simulate_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {
+        "max_concurrency": 2,
+        "add_dependencies": [{"service": "d", "depends_on": "a"}],
+        "add_fault_domains": [{"domain": "az-1", "services": ["b", "c"]}],
+    }
+    responses = [
+        client.post(f"/plans/{plan['id']}/simulate", json=payload).json()
+        for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# GET /plans/{id}/slack-report
+# ---------------------------------------------------------------------------
+
+
+def test_slack_report_dependency_chain_is_all_critical(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]] — every service sits on the 3-wave
+    # critical path, so every slack is 0 and the tight dependency edges form
+    # the constrained-downstream lists.
+    plan = _create_plan(client)
+    r = client.get(f"/plans/{plan['id']}/slack-report")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["wave_count"] == 3
+    assert body["optimal"] is True
+    assert [s["service"] for s in body["services"]] == ["a", "b", "c", "d"]
+    assert {s["service"]: s for s in body["services"]}["a"]["wave"] == 1
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    assert all(
+        s["latest_wave"] == s["wave"] for s in body["services"]
+    )
+    critical = {x["service"]: x for x in body["critical_services"]}
+    assert set(critical) == {"a", "b", "c", "d"}
+    assert critical["a"]["constrained_downstream"] == ["b", "c", "d"]
+    assert critical["b"]["constrained_downstream"] == ["d"]
+    assert critical["c"]["constrained_downstream"] == ["d"]
+    assert critical["d"]["constrained_downstream"] == []
+    for item in body["critical_services"]:
+        stored_wave = next(
+            w["index"]
+            for w in plan["waves"]
+            if item["service"] in w["services"]
+        )
+        assert item["wave"] == stored_wave
+
+
+def test_slack_report_independent_services_have_capacity_slack(client):
+    # Four independent services, cap 2: [[a, b], [c, d]]. Wave-1 members can
+    # each move into wave 2 (leaving capacity behind), wave-2 members cannot
+    # move later, so c and d are the only critical services.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s for s in body["services"]}
+    assert slack["a"] == {
+        "service": "a", "wave": 1, "latest_wave": 2, "slack_waves": 1
+    }
+    assert slack["b"]["slack_waves"] == 1
+    assert slack["c"]["slack_waves"] == 0
+    assert slack["d"]["slack_waves"] == 0
+    assert [x["service"] for x in body["critical_services"]] == ["c", "d"]
+    assert all(x["constrained_downstream"] == [] for x in body["critical_services"])
+
+
+def test_slack_report_single_wave_everything_critical(client):
+    # One wave cannot grow, so nobody can move: all services are critical.
+    plan = _create_plan(client, {"services": ["a", "b"], "max_concurrency": 2})
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    assert body["wave_count"] == 1
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    assert [x["service"] for x in body["critical_services"]] == ["a", "b"]
+
+
+def test_slack_report_fault_domain_member_can_swap(client):
+    # Independent a, b, c with a and b sharing a fault domain, cap 3:
+    # [[a, c], [b]]. a can move to wave 2 while b shifts forward (they just
+    # have to differ), b and c are pinned to the last wave.
+    plan = _create_plan(
+        client,
+        {
+            "services": ["a", "b", "c"],
+            "max_concurrency": 3,
+            "fault_domains": [{"domain": "z", "services": ["a", "b"]}],
+        },
+    )
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s for s in body["services"]}
+    assert slack["a"]["slack_waves"] == 1
+    assert slack["b"]["slack_waves"] == 0
+    assert slack["c"]["slack_waves"] == 0
+    assert [x["service"] for x in body["critical_services"]] == ["b", "c"]
+
+
+def test_slack_report_positive_slack_tight_successor_is_excluded(client):
+    # Chain a -> b -> c (3 waves minimum) with independent d, e, cap 2.
+    # The canonical plan is [[a], [b, d], [c, e]]: a -> d is a tight edge
+    # (waves 1 -> 2) but d itself has slack 1, so d must NOT appear in a's
+    # constrained downstream; only the zero-slack chain b, c does.
+    payload = {
+        "services": ["a", "b", "c", "d", "e"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 2,
+    }
+    plan = _create_plan(client, payload)
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    slack = {s["service"]: s["slack_waves"] for s in body["services"]}
+    assert slack == {"a": 0, "b": 0, "c": 0, "d": 1, "e": 0}
+    critical = {x["service"]: x for x in body["critical_services"]}
+    assert set(critical) == {"a", "b", "c", "e"}
+    assert critical["a"]["constrained_downstream"] == ["b", "c"]
+    assert critical["b"]["constrained_downstream"] == ["c"]
+    assert critical["c"]["constrained_downstream"] == []
+    assert critical["e"]["constrained_downstream"] == []
+
+
+def test_slack_report_payment_example(client):
+    # README scenario: [db] -> [auth] -> [api] -> [cache, web]
+    # (web -> api -> {auth,db}, auth -> db; db/cache share az-a, cap 2).
+    payload = {
+        "name": "payment-platform",
+        "services": ["web", "api", "auth", "db", "cache"],
+        "dependencies": [
+            {"service": "web", "depends_on": "api"},
+            {"service": "api", "depends_on": "auth"},
+            {"service": "api", "depends_on": "db"},
+            {"service": "auth", "depends_on": "db"},
+        ],
+        "max_concurrency": 2,
+        "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+    }
+    plan = _create_plan(client, payload)
+    assert [w["services"] for w in plan["waves"]] == [
+        ["db"],
+        ["auth"],
+        ["api"],
+        ["cache", "web"],
+    ]
+    body = client.get(f"/plans/{plan['id']}/slack-report").json()
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+    critical = {x["service"]: x for x in body["critical_services"]}
+    # cache is not downstream of db over dependency edges — they only share
+    # a fault domain — so it is absent from db's constrained downstream.
+    assert critical["db"]["constrained_downstream"] == ["api", "auth", "web"]
+    assert critical["auth"]["constrained_downstream"] == ["api", "web"]
+    assert critical["api"]["constrained_downstream"] == ["web"]
+    assert critical["cache"]["constrained_downstream"] == []
+    assert critical["web"]["constrained_downstream"] == []
+
+
+def test_slack_report_missing_plan_is_404(client):
+    r = client.get("/plans/9999/slack-report")
+    assert r.status_code == 404
+    body = r.json()
+    assert body["error"] == "not_found"
+    issue = body["issues"][0]
+    assert issue["code"] == "plan_not_found"
+    assert issue["context"] == {"id": 9999}
+
+
+def test_slack_report_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    before = client.get("/plans").json()["total"]
+    assert client.get(f"/plans/{plan['id']}/slack-report").status_code == 200
+    assert client.get("/plans").json()["total"] == before
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_slack_report_is_deterministic(client):
+    plan = _create_plan(client)
+    responses = [
+        client.get(f"/plans/{plan['id']}/slack-report").json() for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+def test_slack_report_works_for_imported_bundle(client):
+    # Imported plans store waves verbatim; the report must still analyze them.
+    plan = _create_plan(client)
+    bundle = client.get(f"/plans/{plan['id']}/bundle").json()
+    imported = client.post("/plans/import", json=bundle)
+    assert imported.status_code in (200, 201)
+    new_id = imported.json()["id"]
+    body = client.get(f"/plans/{new_id}/slack-report").json()
+    assert body["plan_id"] == new_id
+    assert [s["service"] for s in body["services"]] == ["a", "b", "c", "d"]
+    assert all(s["slack_waves"] == 0 for s in body["services"])
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/gate
+# ---------------------------------------------------------------------------
+
+
+def test_gate_with_no_progress_everything_in_first_wave_executes(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]]
+    plan = _create_plan(client)
+    r = client.post(f"/plans/{plan['id']}/gate", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["wave_count"] == 3
+    # Only wave 1 has no dependencies; later waves wait on unfinished deps.
+    assert body["current_wave"] == 1
+    assert body["executable_services"] == ["a"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"b", "c", "d"}
+    assert {reason["code"] for reason in blocked["b"]["reasons"]} == {
+        "dependency_incomplete"
+    }
+    d_codes = {reason["code"] for reason in blocked["d"]["reasons"]}
+    assert d_codes == {"dependency_incomplete"}
+    assert blocked["d"]["wave"] == 3
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["executable"] == ["a"]
+    assert waves[2] == {
+        "index": 2,
+        "executable": [],
+        "blocked": ["b", "c"],
+        "completed": [],
+        "failed": [],
+    }
+    assert waves[3]["blocked"] == ["d"]
+    assert body["completed_services"] == []
+    assert body["failed_services"] == []
+
+
+def test_gate_advances_wave_by_wave(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"completed_services": ["a"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] == 2
+    assert body["executable_services"] == ["b", "c"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"d"}
+    reason = blocked["d"]["reasons"][0]
+    assert reason["code"] == "dependency_incomplete"
+    assert reason["related_services"] in (["b"], ["c"])
+
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "b", "c"]},
+    )
+    body = r.json()
+    assert body["current_wave"] == 3
+    assert body["executable_services"] == ["d"]
+    assert body["blocked_services"] == []
+
+
+def test_gate_all_completed_has_no_current_wave(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] is None
+    assert body["executable_services"] == []
+    assert body["blocked_services"] == []
+    assert body["completed_services"] == ["a", "b", "c", "d"]
+    assert all(
+        w["executable"] == [] and w["blocked"] == [] for w in body["waves"]
+    )
+
+
+def test_gate_failed_service_recursively_blocks_downstream(client):
+    # [[a], [b, c], [d]]: 'a' failing blocks b, c and transitively d.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"failed_services": ["a"]}
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] is None
+    assert body["executable_services"] == []
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"b", "c", "d"}
+
+    for s in ("b", "c"):
+        reason = blocked[s]["reasons"][0]
+        assert reason["code"] == "dependency_failed"
+        assert reason["service"] == s
+        assert reason["related_services"] == ["a"]
+        assert reason["context"]["dependency"] == "a"
+        assert reason["context"]["dependency_status"] == "failed"
+
+    d_reasons = blocked["d"]["reasons"]
+    assert {r["code"] for r in d_reasons} == {"upstream_failure"}
+    d_reason = d_reasons[0]
+    assert d_reason["context"]["failed_roots"] == ["a"]
+    # The directly-blocked prerequisite is named, making the chain localizable.
+    assert d_reason["context"]["dependency"] in ("b", "c")
+    assert "a" in d_reason["related_services"]
+
+
+def test_gate_direct_failure_and_upstream_failure_both_reported(client):
+    # d depends on b and c; b failed -> d gets dependency_failed via b and
+    # upstream_failure via c (c blocked by failed a... build that shape):
+    # use a chain [[a], [b], [c]] where c->b->a and b depends on a.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"c"}
+    reason = blocked["c"]["reasons"][0]
+    assert reason["code"] == "dependency_failed"
+    assert reason["context"]["dependency"] == "b"
+    assert body["failed_services"] == ["b"]
+    wave2 = next(w for w in body["waves"] if w["index"] == 2)
+    assert wave2["failed"] == ["b"]
+    assert wave2["blocked"] == []
+
+
+def test_gate_independent_same_wave_service_still_executes(client):
+    # [[a], [b, c], [d]] with b failed and a completed: c shares wave 2 with
+    # b but depends only on a, so c still executes; d is blocked (by b failed
+    # and c unfinished).
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["current_wave"] == 2
+    assert body["executable_services"] == ["c"]
+    blocked = {item["service"]: item for item in body["blocked_services"]}
+    assert set(blocked) == {"d"}
+    codes = sorted(reason["code"] for reason in blocked["d"]["reasons"])
+    assert codes == ["dependency_failed", "dependency_incomplete"]
+    failed_dep = next(
+        reason
+        for reason in blocked["d"]["reasons"]
+        if reason["code"] == "dependency_failed"
+    )
+    assert failed_dep["context"]["dependency"] == "b"
+    wave2 = next(w for w in body["waves"] if w["index"] == 2)
+    assert wave2["executable"] == ["c"]
+    assert wave2["failed"] == ["b"]
+    assert wave2["blocked"] == []
+
+
+def test_gate_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["ghost"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "completed_services"
+    assert issue["service"] == "ghost"
+
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["phantom"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "failed_services"
+    assert issue["service"] == "phantom"
+
+
+def test_gate_service_reported_completed_and_failed_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a"], "failed_services": ["a"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "service_status_conflict"
+    assert issue["service"] == "a"
+    assert issue["related_services"] == ["a"]
+
+
+def test_gate_duplicate_status_entry_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["a", "a"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_status"
+    assert issue["constraint"] == "completed_services"
+    assert issue["service"] == "a"
+
+
+def test_gate_completed_with_failed_dependency_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["a"], "completed_services": ["b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "completed_with_failed_dependency"
+    assert issue["service"] == "b"
+    assert issue["related_services"] == ["a"]
+    assert issue["context"]["failed_dependencies"] == ["a"]
+
+
+def test_gate_completed_before_dependency_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"completed_services": ["b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "completed_before_dependencies"
+    assert issue["service"] == "b"
+    assert issue["related_services"] == ["a"]
+    assert issue["context"]["unfinished_dependencies"] == ["a"]
+
+
+def test_gate_completed_transitive_failure_is_422(client):
+    # [[a], [b], [c]] chain; a failed, c reported completed -> c's upstream a
+    # failed even though b is unreported.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/gate",
+        json={"failed_services": ["a"], "completed_services": ["c"]},
+    )
+    assert r.status_code == 422
+    codes = {i["code"] for i in r.json()["issues"]}
+    assert codes == {"completed_with_failed_dependency"}
+
+
+def test_gate_missing_plan_is_404(client):
+    r = client.post("/plans/9999/gate", json={})
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_gate_blank_service_id_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"completed_services": ["  "]}
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+    assert body["issues"][0]["constraint"] == "completed_services"
+
+
+def test_gate_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/gate", json={"failed_services": ["a"]}
+    )
+    assert r.status_code == 200
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+
+
+def test_gate_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {"completed_services": ["a"], "failed_services": ["b"]}
+    responses = [
+        client.post(f"/plans/{plan['id']}/gate", json=payload).json()
+        for _ in range(3)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/rollback-preview
+# ---------------------------------------------------------------------------
+
+
+def test_rollback_full_plan_reverses_release_order(client):
+    # Stored release: [[a], [b, c], [d]] (b, c depend on a; d on b and c).
+    # Rollback must be the reverse order: [[d], [b, c], [a]].
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["deployed_services"] == ["a", "b", "c", "d"]
+    assert body["wave_count"] == 3
+    assert [w["services"] for w in body["waves"]] == [["d"], ["b", "c"], ["a"]]
+    assert [w["index"] for w in body["waves"]] == [1, 2, 3]
+    assert body["max_concurrency"] == plan["max_concurrency"]
+    assert body["optimal"] is True
+
+
+def test_rollback_service_waits_for_live_downstream(client):
+    # Release chain [a] -> [b] -> [c] (c depends on b, b on a) with cap 1:
+    # a cannot roll back until b is gone, b cannot until c is gone.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "b"},
+        ],
+        "max_concurrency": 1,
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    assert [w["services"] for w in body["waves"]] == [["c"], ["b"], ["a"]]
+
+
+def test_rollback_respects_concurrency_cap(client):
+    # Four independent services, cap 2: two rollback waves, canonical split.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c", "d"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert all(len(w["services"]) <= 2 for w in body["waves"])
+    assert [w["services"] for w in body["waves"]] == [["a", "b"], ["c", "d"]]
+
+
+def test_rollback_respects_fault_domain_anti_affinity(client):
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b", "c"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 3
+    placement = {s: w["index"] for w in body["waves"] for s in w["services"]}
+    assert len({placement["a"], placement["b"], placement["c"]}) == 3
+
+
+def test_rollback_fault_domain_restricted_to_live_members(client):
+    # Domain az-1 spans a, b, c but only a and b are live; c never deployed,
+    # so it cannot force an extra rollback wave. The two live members still
+    # share the domain and therefore cannot share a wave.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [],
+        "max_concurrency": 3,
+        "fault_domains": [{"domain": "az-1", "services": ["a", "b", "c"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["a"], ["b"]]
+
+    # With just one live member, the clipped clique has no effect.
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a"]},
+    )
+    body = r.json()
+    assert body["wave_count"] == 1
+
+
+def test_rollback_combined_cap_and_fault_domain(client):
+    # README scenario, fully live: release order is
+    # [db] -> [auth] -> [api] -> [cache, web]; rollback is its reverse. The
+    # chain web -> api -> auth -> db needs 4 waves; cache (same fault domain
+    # as db, cap 2) settles canonically in wave 3 with auth.
+    payload = {
+        "name": "payment-platform",
+        "services": ["web", "api", "auth", "db", "cache"],
+        "dependencies": [
+            {"service": "web", "depends_on": "api"},
+            {"service": "api", "depends_on": "auth"},
+            {"service": "api", "depends_on": "db"},
+            {"service": "auth", "depends_on": "db"},
+        ],
+        "max_concurrency": 2,
+        "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+    }
+    plan = _create_plan(client, payload)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["web", "api", "auth", "db", "cache"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 4
+    assert [w["services"] for w in body["waves"]] == [
+        ["web"],
+        ["api"],
+        ["auth", "cache"],
+        ["db"],
+    ]
+
+
+def test_rollback_only_live_services_take_part(client):
+    # BASE: [[a], [b, c], [d]]; d was never deployed, so only a, b, c are
+    # live. The induced subgraph rolls back as [[b, c], [a]]; d is absent.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b", "c"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["deployed_services"] == ["a", "b", "c"]
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["b", "c"], ["a"]]
+
+
+def test_rollback_not_deployed_downstream_does_not_block(client):
+    # Only a and b live (b depends on a); c and d were never deployed. The
+    # absent downstream d must not delay b's rollback: [[b], [a]].
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "b"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 2
+    assert [w["services"] for w in body["waves"]] == [["b"], ["a"]]
+
+
+def test_rollback_single_service(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a"]},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 1
+    assert [w["services"] for w in body["waves"]] == [["a"]]
+
+
+def test_rollback_empty_live_set_is_zero_waves(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": []},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["wave_count"] == 0
+    assert body["waves"] == []
+    assert body["deployed_services"] == []
+    assert body["optimal"] is True
+
+
+def test_rollback_closure_violation_names_missing_prerequisites(client):
+    # b and c live without their prerequisite a: both issues are reported,
+    # each localizable to the missing prerequisite.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["b", "c"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issues = body["issues"]
+    assert len(issues) == 2
+    assert {i["code"] for i in issues} == {"rollback_prerequisite_not_deployed"}
+    by_service = {i["service"]: i for i in issues}
+    assert set(by_service) == {"b", "c"}
+    for issue in by_service.values():
+        assert issue["constraint"] == "deployed_services"
+        assert issue["related_services"] == ["a"]
+        assert issue["context"]["missing_prerequisites"] == ["a"]
+
+
+def test_rollback_closure_violation_multiple_missing_prerequisites(client):
+    # d alone is not a closed set: it is missing both b and c.
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["d"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "rollback_prerequisite_not_deployed"
+    assert issue["service"] == "d"
+    assert issue["related_services"] == ["b", "c"]
+    assert issue["context"]["missing_prerequisites"] == ["b", "c"]
+
+
+def test_rollback_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "ghost"]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "deployed_services"
+    assert issue["service"] == "ghost"
+
+
+def test_rollback_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["a", "a", "b"]},
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service"
+    assert issue["constraint"] == "deployed_services"
+    assert issue["service"] == "a"
+
+
+def test_rollback_blank_service_id_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["  "]},
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+    assert body["issues"][0]["constraint"] == "deployed_services"
+
+
+def test_rollback_missing_plan_is_404(client):
+    r = client.post(
+        "/plans/9999/rollback-preview", json={"deployed_services": ["a"]}
+    )
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_rollback_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    payload = {"deployed_services": ["a", "b"]}
+    r = client.post(f"/plans/{plan['id']}/rollback-preview", json=payload)
+    assert r.status_code == 200
+
+    # A closure-violating request must not modify anything either.
+    bad = client.post(
+        f"/plans/{plan['id']}/rollback-preview",
+        json={"deployed_services": ["d"]},
+    )
+    assert bad.status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_rollback_is_deterministic_and_input_order_stable(client):
+    plan = _create_plan(client)
+    responses = [
+        client.post(
+            f"/plans/{plan['id']}/rollback-preview",
+            json={"deployed_services": order},
+        ).json()
+        for order in (
+            ["d", "c", "b", "a"],
+            ["a", "b", "c", "d"],
+            ["b", "a", "d", "c"],
+        )
+    ]
+    assert responses[0] == responses[1] == responses[2]
+    assert responses[0]["deployed_services"] == ["a", "b", "c", "d"]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/timeline-audit
+# ---------------------------------------------------------------------------
+
+
+def _timeline_entry(service, started, finished):
+    return {"service": service, "started_at": started, "finished_at": finished}
+
+
+def test_timeline_audit_valid_timeline(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]], d depends on b and c.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:40Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["valid"] is True
+    assert body["violations"] == []
+
+    timings = body["service_timings"]
+    assert timings["a"]["duration_ms"] == 10_000
+    assert timings["b"]["duration_ms"] == 10_000
+    assert timings["c"]["duration_ms"] == 30_000
+    assert timings["d"]["duration_ms"] == 10_000
+    assert timings["a"]["started_at"] == "2026-09-22T10:00:00Z"
+
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["started_at"] == "2026-09-22T10:00:00Z"
+    assert waves[1]["finished_at"] == "2026-09-22T10:00:10Z"
+    assert waves[1]["duration_ms"] == 10_000
+    assert waves[1]["services"] == ["a"]
+    assert waves[2]["duration_ms"] == 30_000  # b finishes at :20, c at :40
+    assert waves[2]["services"] == ["b", "c"]
+    assert waves[3]["duration_ms"] == 10_000
+
+    assert body["total_duration_ms"] == 50_000
+
+
+def test_timeline_audit_critical_chain_uses_service_durations(client):
+    # [[a], [b, c], [d]]; chains: a-b-d (10+10+10=30s), a-c-d (10+30+10=50s).
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:40Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    chain = body["critical_chain"]
+    assert chain["services"] == ["a", "c", "d"]
+    assert chain["duration_ms"] == 50_000
+
+
+def test_timeline_audit_critical_chain_tie_resolves_lexicographically(client):
+    # All durations equal: the length-3 chains a->b->d and a->c->d tie, and
+    # the prerequisite-first lexicographically smallest chain is reported.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:30Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["critical_chain"]["services"] == ["a", "b", "d"]
+    assert body["critical_chain"]["duration_ms"] == 30_000
+
+
+def test_timeline_audit_dependency_violation_overlap(client):
+    # d starts 5s before its (late) prerequisite c finishes; b is fine. The
+    # dependency edge d->c and the wave-2 barrier are both broken by the same
+    # late member c, so both violations are reported, each with the overlap.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:35Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["valid"] is False
+    dep_violations = [
+        v for v in body["violations"] if v["constraint_type"] == "dependency"
+    ]
+    assert len(dep_violations) == 1
+    violation = dep_violations[0]
+    assert violation["service"] == "d"
+    assert violation["constraint"] == "c"
+    assert violation["blocking_service"] == "c"
+    assert violation["overlap_ms"] == 5_000
+    # Durations and the critical chain are still computed on well-formed input.
+    assert body["service_timings"]["d"]["duration_ms"] == 15_000
+    assert body["critical_chain"]["services"] == ["a", "c", "d"]
+
+
+def test_timeline_audit_each_unfinished_dependency_is_reported(client):
+    # d starts while BOTH direct prerequisites b and c are still running:
+    # two dependency violations (one per edge) plus the wave-2 barrier.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:30Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    dep = {
+        v["constraint"]: v
+        for v in body["violations"]
+        if v["constraint_type"] == "dependency"
+    }
+    assert set(dep) == {"b", "c"}
+    assert dep["b"]["overlap_ms"] == 10_000
+    assert dep["c"]["overlap_ms"] == 20_000
+    wave = [v for v in body["violations"] if v["constraint_type"] == "previous_wave"]
+    assert len(wave) == 1
+    assert wave[0]["constraint"] == "wave 2"
+    assert wave[0]["blocking_service"] == "c"
+    assert wave[0]["overlap_ms"] == 20_000
+
+
+def test_timeline_audit_previous_wave_violation_names_blocker(client):
+    # Independent services with a concurrency cap produce capacity-driven
+    # waves with no dependency edges: [[a, b], [c, d]]. c starts while the
+    # latest-finishing member of wave 1 (a) is still running.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c", "d"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("b", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("c", "2026-09-22T10:00:15Z", "2026-09-22T10:00:25Z"),
+            _timeline_entry("d", "2026-09-22T10:00:25Z", "2026-09-22T10:00:35Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    assert len(body["violations"]) == 1
+    v = body["violations"][0]
+    assert v["service"] == "c"
+    assert v["constraint_type"] == "previous_wave"
+    assert v["constraint"] == "wave 1"
+    assert v["blocking_service"] == "a"
+    assert v["overlap_ms"] == 5_000
+
+
+def test_timeline_audit_wave_barrier_uses_latest_finishing_member(client):
+    # Wave 2 = [b, c]. d starts after b finished but 3s before c finishes:
+    # one dependency violation (c) and one wave-2 barrier violation (blocker c).
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:37Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is False
+    types = {(v["constraint_type"], v["constraint"]) for v in body["violations"]}
+    assert ("dependency", "c") in types
+    assert ("previous_wave", "wave 2") in types
+    for v in body["violations"]:
+        if v["constraint_type"] == "previous_wave":
+            assert v["service"] == "d"
+            assert v["blocking_service"] == "c"
+            assert v["overlap_ms"] == 3_000
+
+
+def test_timeline_audit_exact_coincidence_is_not_a_violation(client):
+    # Starting at the exact finish instant of every prerequisite is allowed
+    # (zero overlap), including sub-second precision and timezone offsets.
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T12:00:00+02:00", "2026-09-22T12:00:00.500+02:00"),
+            _timeline_entry("b", "2026-09-22T10:00:00.500Z", "2026-09-22T10:00:01Z"),
+            _timeline_entry("c", "2026-09-22T10:00:00.500Z", "2026-09-22T10:00:01Z"),
+            _timeline_entry("d", "2026-09-22T10:00:01Z", "2026-09-22T10:00:02Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["violations"] == []
+    # Naive timestamps are interpreted as UTC; a started at 10:00:00Z.
+    assert body["service_timings"]["a"]["started_at"] == "2026-09-22T10:00:00Z"
+    assert body["service_timings"]["a"]["duration_ms"] == 500
+
+
+def test_timeline_audit_naive_timestamp_is_read_as_utc(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00", "2026-09-22T10:00:10"),
+            _timeline_entry("b", "2026-09-22T10:00:10", "2026-09-22T10:00:20"),
+            _timeline_entry("c", "2026-09-22T10:00:10", "2026-09-22T10:00:20"),
+            _timeline_entry("d", "2026-09-22T10:00:20", "2026-09-22T10:00:30"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["service_timings"]["a"]["started_at"] == "2026-09-22T10:00:00Z"
+
+
+def test_timeline_audit_missing_service_is_422(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            # d missing
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "missing_service_timeline"
+    assert issue["service"] == "d"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c", "d")
+    ]
+    entries.append(
+        _timeline_entry("ghost", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["service"] == "ghost"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c")
+    ]
+    entries.append(
+        _timeline_entry("a", "2026-09-22T11:00:00Z", "2026-09-22T11:00:10Z")
+    )
+    entries.append(
+        _timeline_entry("d", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_timeline"
+    assert issue["service"] == "a"
+    assert issue["constraint"] == "service_timelines"
+
+
+def test_timeline_audit_inverted_window_is_422(client):
+    plan = _create_plan(client)
+    entries = [
+        _timeline_entry(s, "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        for s in ("a", "b", "c", "d")
+    ]
+    entries[2] = _timeline_entry(
+        "c", "2026-09-22T10:00:20Z", "2026-09-22T10:00:10Z"
+    )
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": entries}
+    )
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "timeline_inverted"
+    assert issue["service"] == "c"
+    assert issue["constraint"] == "service_timelines"
+    assert issue["context"]["started_at"] == "2026-09-22T10:00:20+00:00"
+    assert issue["context"]["finished_at"] == "2026-09-22T10:00:10+00:00"
+
+
+def test_timeline_audit_zero_duration_window_is_allowed(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:00Z"),
+            _timeline_entry("b", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("c", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("d", "2026-09-22T10:00:10Z", "2026-09-22T10:00:10Z"),
+        ]
+    }
+    body = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload).json()
+    assert body["valid"] is True
+    assert body["service_timings"]["a"]["duration_ms"] == 0
+    assert body["total_duration_ms"] == 10_000
+
+
+def test_timeline_audit_bad_timestamp_is_validation_error(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            {"service": "a", "started_at": "not-a-date", "finished_at": "2026-09-22T10:00:10Z"},
+        ]
+    }
+    r = client.post(f"/plans/{plan['id']}/timeline-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    issue = body["issues"][0]
+    assert issue["code"] == "invalid_request_field"
+    assert "started_at" in issue["constraint"]
+    # The nested property name must not be mistaken for a service id.
+    assert issue["service"] is None
+
+
+def test_timeline_audit_empty_list_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/timeline-audit", json={"service_timelines": []}
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_timeline_audit_missing_plan_is_404(client):
+    # A syntactically valid body still gets 404: the plan lookup precedes the
+    # semantic coverage check.
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z")
+        ]
+    }
+    r = client.post("/plans/9999/timeline-audit", json=payload)
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_timeline_audit_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    valid = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("d", "2026-09-22T10:00:20Z", "2026-09-22T10:00:30Z"),
+        ]
+    }
+    assert client.post(f"/plans/{plan['id']}/timeline-audit", json=valid).status_code == 200
+
+    bad = {"service_timelines": [valid["service_timelines"][0]]}
+    assert client.post(f"/plans/{plan['id']}/timeline-audit", json=bad).status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_timeline_audit_is_deterministic(client):
+    plan = _create_plan(client)
+    payload = {
+        "service_timelines": [
+            _timeline_entry("a", "2026-09-22T10:00:00Z", "2026-09-22T10:00:10Z"),
+            _timeline_entry("b", "2026-09-22T10:00:10Z", "2026-09-22T10:00:20Z"),
+            _timeline_entry("c", "2026-09-22T10:00:10Z", "2026-09-22T10:00:40Z"),
+            _timeline_entry("d", "2026-09-22T10:00:35Z", "2026-09-22T10:00:50Z"),
+        ]
+    }
+    shuffled = {"service_timelines": list(reversed(payload["service_timelines"]))}
+    responses = [
+        client.post(f"/plans/{plan['id']}/timeline-audit", json=body).json()
+        for body in (payload, shuffled, payload)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/ownership-audit
+# ---------------------------------------------------------------------------
+
+
+PAYMENT_PAYLOAD = {
+    "name": "payment-platform",
+    "services": ["web", "api", "auth", "db", "cache"],
+    "dependencies": [
+        {"service": "web", "depends_on": "api"},
+        {"service": "api", "depends_on": "auth"},
+        {"service": "api", "depends_on": "db"},
+        {"service": "auth", "depends_on": "db"},
+    ],
+    "max_concurrency": 2,
+    "fault_domains": [{"domain": "az-a", "services": ["db", "cache"]}],
+}
+
+
+def test_ownership_audit_payment_example(client):
+    # Stored waves: [db] -> [auth] -> [api] -> [cache, web]
+    # db=data; auth,api=backend; cache,web=edge (share stored wave 4).
+    plan = _create_plan(client, PAYMENT_PAYLOAD)
+    payload = {
+        "ownership": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "backend"},
+            {"service": "api", "team": "backend"},
+            {"service": "cache", "team": "edge"},
+            {"service": "web", "team": "edge"},
+        ],
+        # A cap declared for a team that owns nothing is simply ignored.
+        "team_oncall_caps": {"data": 1, "backend": 1, "edge": 1, "ghost-team": 3},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["name"] == "payment-platform"
+    assert body["wave_count"] == 4
+    assert body["unowned_services"] == []
+
+    teams = {t["team"]: t for t in body["teams"]}
+    assert sorted(teams) == ["backend", "data", "edge"]
+    assert teams["data"] == {
+        "team": "data",
+        "service_count": 1,
+        "services": ["db"],
+        "oncall_cap": 1,
+        "overlimit": [],
+    }
+    assert teams["backend"]["services"] == ["api", "auth"]
+    assert teams["backend"]["service_count"] == 2
+    assert teams["backend"]["overlimit"] == []  # api and auth sit in different waves
+    assert teams["edge"]["services"] == ["cache", "web"]
+    # cache and web are simultaneously on call in stored wave 4, cap is 1.
+    assert teams["edge"]["overlimit"] == [
+        {
+            "team": "edge",
+            "wave": 4,
+            "services": ["cache", "web"],
+            "service_count": 2,
+            "oncall_cap": 1,
+            "over_by": 1,
+        }
+    ]
+
+    cross = body["cross_team_dependencies"]
+    assert cross == [
+        {
+            "service": "api",
+            "service_team": "backend",
+            "depends_on": "db",
+            "depends_on_team": "data",
+        },
+        {
+            "service": "auth",
+            "service_team": "backend",
+            "depends_on": "db",
+            "depends_on_team": "data",
+        },
+        {
+            "service": "web",
+            "service_team": "edge",
+            "depends_on": "api",
+            "depends_on_team": "backend",
+        },
+    ]
+    # data provides prerequisites first, edge consumes backend last.
+    assert body["coordination_order"] == ["data", "backend", "edge"]
+
+    assert body["fault_domain_coupling"] == [
+        {
+            "domain": "az-a",
+            "teams": ["data", "edge"],
+            "services": ["cache", "db"],
+            "coupled": True,
+        }
+    ]
+
+
+def test_ownership_audit_cross_team_dependencies_and_order(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]]; one distinct team per service.
+    # b(t2),c(t3) depend on a(t1); d(t4) depends on b and c.
+    plan = _create_plan(client)
+    payload = {
+        "ownership": [
+            {"service": "a", "team": "t1"},
+            {"service": "b", "team": "t2"},
+            {"service": "c", "team": "t3"},
+            {"service": "d", "team": "t4"},
+        ],
+        "team_oncall_caps": {"t1": 1, "t2": 1, "t3": 1, "t4": 1},
+    }
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit", json=payload
+    ).json()
+    assert body["unowned_services"] == []
+    assert [(e["service"], e["depends_on"]) for e in body["cross_team_dependencies"]] == [
+        ("b", "a"),
+        ("c", "a"),
+        ("d", "b"),
+        ("d", "c"),
+    ]
+    assert body["coordination_order"] == ["t1", "t2", "t3", "t4"]
+    assert all(t["overlimit"] == [] for t in body["teams"])
+
+
+def test_ownership_audit_lexicographic_tie_break_in_order(client):
+    # Two independent downstream teams both depend on one upstream team:
+    # they become ready simultaneously and the tie resolves lexicographically.
+    payload = {
+        "services": ["a", "b", "c"],
+        "dependencies": [
+            {"service": "b", "depends_on": "a"},
+            {"service": "c", "depends_on": "a"},
+        ],
+        "max_concurrency": 2,
+    }
+    plan = _create_plan(client, payload)
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "ownership": [
+                {"service": "a", "team": "zeta"},
+                {"service": "b", "team": "alpha"},
+                {"service": "c", "team": "mid"},
+            ],
+            "team_oncall_caps": {"zeta": 1, "alpha": 1, "mid": 1},
+        },
+    ).json()
+    assert body["coordination_order"] == ["zeta", "alpha", "mid"]
+    assert {
+        (e["service_team"], e["depends_on_team"])
+        for e in body["cross_team_dependencies"]
+    } == {("alpha", "zeta"), ("mid", "zeta")}
+    assert {t["team"]: t["service_count"] for t in body["teams"]} == {
+        "alpha": 1,
+        "mid": 1,
+        "zeta": 1,
+    }
+
+
+def test_ownership_audit_unowned_services_are_findings(client):
+    # Omitting services from the map is legal: they come back as unowned, and
+    # edges touching them do not appear as cross-team dependencies.
+    plan = _create_plan(client, PAYMENT_PAYLOAD)
+    payload = {
+        "ownership": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "backend"},
+            {"service": "api", "team": "backend"},
+            {"service": "web", "team": "edge"},
+        ],
+        "team_oncall_caps": {"data": 1, "backend": 1, "edge": 1},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["unowned_services"] == ["cache"]
+    # az-a now only has db owned (data) -> no team coupling.
+    assert body["fault_domain_coupling"] == [
+        {"domain": "az-a", "teams": ["data"], "services": ["cache", "db"], "coupled": False}
+    ]
+    # No edge touches cache, so cross-team dependencies are unchanged apart
+    # from the cache-less graph; team summaries exclude no one.
+    assert sorted(t["team"] for t in body["teams"]) == ["backend", "data", "edge"]
+
+
+def test_ownership_audit_oncall_overlimit_single_wave(client):
+    # Three independent services in one stored wave (cap 3); team t owns two
+    # of them with an on-call cap of 1.
+    plan = _create_plan(
+        client, {"services": ["a", "b", "c"], "max_concurrency": 3}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b", "c"]]
+    payload = {
+        "ownership": [
+            {"service": "a", "team": "t"},
+            {"service": "b", "team": "t"},
+            {"service": "c", "team": "u"},
+        ],
+        "team_oncall_caps": {"t": 1, "u": 1},
+    }
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit", json=payload
+    ).json()
+    teams = {t["team"]: t for t in body["teams"]}
+    assert teams["t"]["overlimit"] == [
+        {
+            "team": "t",
+            "wave": 1,
+            "services": ["a", "b"],
+            "service_count": 2,
+            "oncall_cap": 1,
+            "over_by": 1,
+        }
+    ]
+    assert teams["u"]["overlimit"] == []
+    assert body["cross_team_dependencies"] == []
+    assert body["coordination_order"] == []
+
+
+def test_ownership_audit_fault_domain_coupling_report(client):
+    payload = {
+        "services": ["a", "b", "c", "d"],
+        "max_concurrency": 4,
+        "fault_domains": [
+            {"domain": "multi", "services": ["a", "b"]},
+            {"domain": "single", "services": ["c", "d"]},
+        ],
+    }
+    plan = _create_plan(client, payload)
+    body = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={
+            "ownership": [
+                {"service": "a", "team": "x"},
+                {"service": "b", "team": "y"},
+                {"service": "c", "team": "x"},
+                {"service": "d", "team": "x"},
+            ],
+            "team_oncall_caps": {"x": 2, "y": 2},
+        },
+    ).json()
+    coupling = {c["domain"]: c for c in body["fault_domain_coupling"]}
+    assert coupling["multi"]["coupled"] is True
+    assert coupling["multi"]["teams"] == ["x", "y"]
+    assert coupling["single"]["coupled"] is False
+    assert coupling["single"]["teams"] == ["x"]
+
+
+def test_ownership_audit_empty_ownership(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/ownership-audit",
+        json={"ownership": [], "team_oncall_caps": {}},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["teams"] == []
+    assert body["unowned_services"] == ["a", "b", "c", "d"]
+    assert body["cross_team_dependencies"] == []
+    assert body["coordination_order"] == []
+    assert all(c["coupled"] is False for c in body["fault_domain_coupling"])
+
+
+def test_ownership_audit_is_deterministic_and_input_order_stable(client):
+    plan = _create_plan(client, PAYMENT_PAYLOAD)
+    payload = {
+        "ownership": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "backend"},
+            {"service": "api", "team": "backend"},
+            {"service": "cache", "team": "edge"},
+            {"service": "web", "team": "edge"},
+        ],
+        "team_oncall_caps": {"edge": 1, "data": 1, "backend": 1},
+    }
+    shuffled = {
+        "ownership": list(reversed(payload["ownership"])),
+        "team_oncall_caps": {
+            "backend": 1,
+            "edge": 1,
+            "data": 1,
+        },
+    }
+    responses = [
+        client.post(f"/plans/{plan['id']}/ownership-audit", json=body).json()
+        for body in (payload, shuffled, payload)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+def test_ownership_audit_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    payload = {
+        "ownership": [
+            {"service": "a", "team": "t"},
+            {"service": "ghost", "team": "t"},
+        ],
+        "team_oncall_caps": {"t": 1},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "unknown_service"
+    assert issue["constraint"] == "ownership"
+    assert issue["service"] == "ghost"
+
+
+def test_ownership_audit_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    payload = {
+        "ownership": [
+            {"service": "a", "team": "t1"},
+            {"service": "a", "team": "t2"},
+        ],
+        "team_oncall_caps": {"t1": 1, "t2": 1},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_owner"
+    assert issue["constraint"] == "ownership"
+    assert issue["service"] == "a"
+    assert issue["context"]["teams"] == ["t1", "t2"]
+
+    # The same team repeated is a duplicate as well.
+    payload = {
+        "ownership": [
+            {"service": "b", "team": "t"},
+            {"service": "b", "team": "t"},
+        ],
+        "team_oncall_caps": {"t": 1},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_owner"
+    assert issue["service"] == "b"
+
+
+def test_ownership_audit_blank_team_is_422(client):
+    plan = _create_plan(client)
+    for blank in ("", "   "):
+        payload = {
+            "ownership": [{"service": "a", "team": blank}],
+            "team_oncall_caps": {},
+        }
+        r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+        assert r.status_code == 422, r.text
+        issue = r.json()["issues"][0]
+        assert issue["code"] == "missing_service_owner"
+        assert issue["constraint"] == "ownership"
+        assert issue["service"] == "a"
+
+
+def test_ownership_audit_missing_team_cap_is_422(client):
+    plan = _create_plan(client)
+    payload = {
+        "ownership": [
+            {"service": "a", "team": "t1"},
+            {"service": "b", "team": "t2"},
+        ],
+        "team_oncall_caps": {"t1": 1},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "team_oncall_cap_missing"
+    assert issue["constraint"] == "team_oncall_caps"
+    assert issue["context"]["team"] == "t2"
+
+
+def test_ownership_audit_non_positive_cap_is_validation_error(client):
+    plan = _create_plan(client)
+    payload = {
+        "ownership": [{"service": "a", "team": "t"}],
+        "team_oncall_caps": {"t": 0},
+    }
+    r = client.post(f"/plans/{plan['id']}/ownership-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "validation_error"
+    assert body["issues"][0]["code"] == "invalid_request_field"
+
+
+def test_ownership_audit_missing_plan_is_structured_422(client):
+    payload = {"ownership": [], "team_oncall_caps": {}}
+    r = client.post("/plans/9999/ownership-audit", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "not_found"
+    issue = body["issues"][0]
+    assert issue["code"] == "plan_not_found"
+    assert issue["constraint"] == "plan_id"
+    assert issue["context"] == {"id": 9999}
+
+
+def test_ownership_audit_does_not_modify_stored_plan(client):
+    plan = _create_plan(client, PAYMENT_PAYLOAD)
+    good = {
+        "ownership": [
+            {"service": "db", "team": "data"},
+            {"service": "auth", "team": "backend"},
+            {"service": "api", "team": "backend"},
+            {"service": "cache", "team": "edge"},
+            {"service": "web", "team": "edge"},
+        ],
+        "team_oncall_caps": {"data": 1, "backend": 1, "edge": 1},
+    }
+    assert (
+        client.post(f"/plans/{plan['id']}/ownership-audit", json=good).status_code
+        == 200
+    )
+    bad = {
+        "ownership": [{"service": "ghost", "team": "t"}],
+        "team_oncall_caps": {"t": 1},
+    }
+    assert (
+        client.post(f"/plans/{plan['id']}/ownership-audit", json=bad).status_code
+        == 422
+    )
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
