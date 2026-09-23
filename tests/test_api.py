@@ -1727,6 +1727,353 @@ def test_timeline_audit_is_deterministic(client):
 
 
 # ---------------------------------------------------------------------------
+# POST /plans/{id}/window-preview
+# ---------------------------------------------------------------------------
+
+
+def _service_window(service, duration_ms, blocked_windows=None):
+    return {
+        "service": service,
+        "duration_ms": duration_ms,
+        "blocked_windows": blocked_windows or [],
+    }
+
+
+def _blocked(frm, to):
+    return {"blocked_from": frm, "blocked_to": to}
+
+
+def _preview_body(start="2026-09-22T10:00:00Z", **durations):
+    return {
+        "start_at": start,
+        "service_windows": [
+            _service_window(service, duration_ms)
+            for service, duration_ms in durations.items()
+        ],
+    }
+
+
+def test_window_preview_no_blocked_windows_is_back_to_back(client):
+    # BASE_PAYLOAD: [[a], [b, c], [d]]; durations a=10s, b=20s, c=40s, d=10s.
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=20_000, c=40_000, d=10_000)
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["start_at"] == "2026-09-22T10:00:00Z"
+    assert body["wave_count"] == 3
+    assert body["finished_at"] == "2026-09-22T10:01:00Z"
+    assert body["total_duration_ms"] == 60_000
+
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["started_at"] == "2026-09-22T10:00:00Z"
+    assert waves[1]["finished_at"] == "2026-09-22T10:00:10Z"
+    assert waves[1]["duration_ms"] == 10_000
+    assert waves[2]["started_at"] == "2026-09-22T10:00:10Z"
+    # Wave members start together; the wave ends at the latest completion (c).
+    assert waves[2]["finished_at"] == "2026-09-22T10:00:50Z"
+    assert waves[2]["duration_ms"] == 40_000
+    assert waves[3]["started_at"] == "2026-09-22T10:00:50Z"
+    assert waves[3]["finished_at"] == "2026-09-22T10:01:00Z"
+
+    members = {m["service"]: m for m in waves[2]["services"]}
+    assert members["b"] == {
+        "service": "b",
+        "started_at": "2026-09-22T10:00:10Z",
+        "finished_at": "2026-09-22T10:00:30Z",
+        "duration_ms": 20_000,
+    }
+    assert members["c"]["finished_at"] == "2026-09-22T10:00:50Z"
+    # Member lists are stably sorted.
+    assert [m["service"] for m in waves[2]["services"]] == ["b", "c"]
+
+
+def test_window_preview_conflict_pushes_whole_wave_and_cascades(client):
+    # c is blocked over the whole first-pass window 10:00:10..11:00:00. Wave 2
+    # (b and c) starts together at 11:00; wave 3 (d) starts at its finish.
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=20_000, c=40_000, d=10_000)
+    payload["service_windows"][2]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T11:00:00Z")
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    waves = {w["index"]: w for w in body["waves"]}
+    assert waves[1]["started_at"] == "2026-09-22T10:00:00Z"
+    assert waves[2]["started_at"] == "2026-09-22T11:00:00Z"
+    assert waves[2]["finished_at"] == "2026-09-22T11:00:40Z"
+    assert waves[3]["started_at"] == "2026-09-22T11:00:40Z"
+    assert waves[3]["finished_at"] == "2026-09-22T11:00:50Z"
+    assert body["finished_at"] == "2026-09-22T11:00:50Z"
+    # b rides along even though b itself has no blocked window.
+    b = next(m for m in waves[2]["services"] if m["service"] == "b")
+    assert b["started_at"] == "2026-09-22T11:00:00Z"
+
+
+def test_window_preview_conflict_inside_run_pushes_to_interval_end(client):
+    # Blocked [10:00:05, 10:00:06) sits inside the 10s run: wave starts 10:00:06.
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    payload = _preview_body(a=10_000)
+    payload["service_windows"][0]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:05Z", "2026-09-22T10:00:06Z")
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    wave = body["waves"][0]
+    assert wave["started_at"] == "2026-09-22T10:00:06Z"
+    assert wave["finished_at"] == "2026-09-22T10:00:16Z"
+
+
+def test_window_preview_repeated_conflicts_retake_earliest_feasible(client):
+    # 1-hour run starting 10:00 hits [10:00,10:30) and [10:15,11:30) -> 11:30,
+    # where it still hits [11:00,12:00) -> 12:00, the first feasible instant.
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    payload = _preview_body(a=3_600_000)
+    payload["service_windows"][0]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T10:30:00Z"),
+        _blocked("2026-09-22T11:00:00Z", "2026-09-22T12:00:00Z"),
+        _blocked("2026-09-22T10:15:00Z", "2026-09-22T11:30:00Z"),
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    wave = body["waves"][0]
+    assert wave["started_at"] == "2026-09-22T12:00:00Z"
+    assert wave["finished_at"] == "2026-09-22T13:00:00Z"
+    # Wall-clock span from the requested start, including the blocked wait.
+    assert body["total_duration_ms"] == 10_800_000
+
+
+def test_window_preview_intervals_are_half_open(client):
+    # Touching an interval END is allowed; a blocked interval that starts at the
+    # exact finish instant never intersects the half-open run window.
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    payload = _preview_body(a=10_000)
+    payload["service_windows"][0]["blocked_windows"] = [
+        _blocked("2026-09-22T09:00:00Z", "2026-09-22T10:00:00Z"),
+        _blocked("2026-09-22T10:00:10Z", "2026-09-22T11:00:00Z"),
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    assert body["waves"][0]["started_at"] == "2026-09-22T10:00:00Z"
+
+    # One-millisecond overlap is a real conflict and pushes to the interval end.
+    payload["service_windows"][0]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:09.999+00:00", "2026-09-22T11:00:00Z"),
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    assert body["waves"][0]["started_at"] == "2026-09-22T11:00:00Z"
+
+
+def test_window_preview_blocked_member_only_pushes_shared_wave(client):
+    # Wave [x, y]: x alone is blocked until 10:05; y (30s) is clear. Both start
+    # at 10:05 and the wave ends at y's completion 10:05:30.
+    plan = _create_plan(
+        client, payload={"services": ["x", "y"], "max_concurrency": 2}
+    )
+    assert [w["services"] for w in plan["waves"]] == [["x", "y"]]
+    payload = _preview_body(y=30_000, x=10_000)
+    x_entry = next(e for e in payload["service_windows"] if e["service"] == "x")
+    x_entry["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T10:05:00Z")
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    wave = body["waves"][0]
+    assert wave["started_at"] == "2026-09-22T10:05:00Z"
+    assert wave["finished_at"] == "2026-09-22T10:05:30Z"
+    assert wave["duration_ms"] == 30_000
+    assert body["finished_at"] == "2026-09-22T10:05:30Z"
+
+
+def test_window_preview_only_own_blocked_intervals_apply(client):
+    # b is blocked during wave 2's window, but a's blocked interval covering the
+    # same period does not affect wave 2: every wave member checks only its own.
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=20_000, c=20_000, d=10_000)
+    a_entry = next(e for e in payload["service_windows"] if e["service"] == "a")
+    a_entry["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:10Z", "2026-09-22T11:00:00Z")
+    ]
+    b_entry = next(e for e in payload["service_windows"] if e["service"] == "b")
+    b_entry["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:10Z", "2026-09-22T10:00:30Z")
+    ]
+    body = client.post(
+        f"/plans/{plan['id']}/window-preview", json=payload
+    ).json()
+    waves = {w["index"]: w for w in body["waves"]}
+    # a already finished at 10:00:10, its later blocked interval is irrelevant.
+    assert waves[1]["started_at"] == "2026-09-22T10:00:00Z"
+    # b blocked 10:00:10..10:00:30, c clear -> wave 2 pushed to 10:00:30.
+    assert waves[2]["started_at"] == "2026-09-22T10:00:30Z"
+    assert waves[3]["started_at"] == "2026-09-22T10:00:50Z"
+
+
+def test_window_preview_naive_and_offset_timestamps_become_utc(client):
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    for start in ("2026-09-22T10:00:00", "2026-09-22T12:00:00+02:00"):
+        payload = _preview_body(start=start, a=10_000)
+        body = client.post(
+            f"/plans/{plan['id']}/window-preview", json=payload
+        ).json()
+        assert body["start_at"] == "2026-09-22T10:00:00Z"
+        assert body["waves"][0]["started_at"] == "2026-09-22T10:00:00Z"
+
+
+def test_window_preview_missing_service_is_422(client):
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=10_000, c=10_000)  # d missing
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "missing_service_window"
+    assert issue["service"] == "d"
+    assert issue["constraint"] == "service_windows"
+
+
+def test_window_preview_unknown_service_is_422(client):
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=10_000, c=10_000, d=10_000)
+    payload["service_windows"].append(_service_window("ghost", 10_000))
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    issue = next(
+        i for i in r.json()["issues"] if i["code"] == "unknown_service"
+    )
+    assert issue["service"] == "ghost"
+    assert issue["constraint"] == "service_windows"
+
+
+def test_window_preview_duplicate_service_is_422(client):
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=10_000, c=10_000, d=10_000)
+    payload["service_windows"].append(_service_window("a", 5_000))
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "duplicate_service_window"
+    assert issue["service"] == "a"
+    assert issue["constraint"] == "service_windows"
+
+
+def test_window_preview_non_positive_duration_is_validation_error(client):
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    for duration in (0, -10):
+        r = client.post(
+            f"/plans/{plan['id']}/window-preview",
+            json=_preview_body(a=duration),
+        )
+        assert r.status_code == 422
+        body = r.json()
+        assert body["error"] == "validation_error"
+        issue = body["issues"][0]
+        assert issue["code"] == "invalid_request_field"
+        assert issue["constraint"] == "service_windows.0.duration_ms"
+        # The nested property must not be mistaken for a service id.
+        assert issue["service"] is None
+
+
+def test_window_preview_degenerate_blocked_window_is_422(client):
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    for frm, to in (
+        ("2026-09-22T10:00:10Z", "2026-09-22T10:00:10Z"),  # empty
+        ("2026-09-22T10:00:20Z", "2026-09-22T10:00:10Z"),  # inverted
+    ):
+        payload = _preview_body(a=10_000)
+        payload["service_windows"][0]["blocked_windows"] = [_blocked(frm, to)]
+        r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+        assert r.status_code == 422
+        issue = r.json()["issues"][0]
+        assert issue["code"] == "blocked_window_invalid"
+        assert issue["service"] == "a"
+        assert issue["constraint"] == "service_windows"
+        assert issue["context"]["blocked_from"] is not None
+
+
+def test_window_preview_bad_timestamps_are_validation_error(client):
+    plan = _create_plan(client, payload={"services": ["a"], "max_concurrency": 1})
+    bad_bodies = [
+        {"start_at": "not-a-date",
+         "service_windows": [_service_window("a", 10_000)]},
+        {"start_at": "2026-09-22T10:00:00Z",
+         "service_windows": [_service_window("a", 10_000, [
+             _blocked("nope", "2026-09-22T10:00:10Z")])]},
+    ]
+    for body in bad_bodies:
+        r = client.post(f"/plans/{plan['id']}/window-preview", json=body)
+        assert r.status_code == 422
+        envelope = r.json()
+        assert envelope["error"] == "validation_error"
+        assert envelope["issues"][0]["service"] is None
+
+
+def test_window_preview_empty_list_is_validation_error(client):
+    plan = _create_plan(client)
+    r = client.post(
+        f"/plans/{plan['id']}/window-preview",
+        json={"start_at": "2026-09-22T10:00:00Z", "service_windows": []},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_window_preview_missing_plan_is_404(client):
+    payload = _preview_body(a=10_000)
+    r = client.post("/plans/9999/window-preview", json=payload)
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_window_preview_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=20_000, c=40_000, d=10_000)
+    payload["service_windows"][2]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T11:00:00Z")
+    ]
+    assert (
+        client.post(f"/plans/{plan['id']}/window-preview", json=payload).status_code
+        == 200
+    )
+    bad = {"start_at": "2026-09-22T10:00:00Z", "service_windows": [_service_window("a", 10_000)]}
+    assert client.post(f"/plans/{plan['id']}/window-preview", json=bad).status_code == 422
+
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert fetched["wave_count"] == plan["wave_count"]
+    assert client.get("/plans").json()["total"] == 1
+
+
+def test_window_preview_is_deterministic_and_input_order_stable(client):
+    plan = _create_plan(client)
+    payload = _preview_body(a=10_000, b=20_000, c=40_000, d=10_000)
+    payload["service_windows"][0]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T10:00:05Z")
+    ]
+    payload["service_windows"][2]["blocked_windows"] = [
+        _blocked("2026-09-22T10:00:00Z", "2026-09-22T11:00:00Z")
+    ]
+    shuffled = {
+        "start_at": payload["start_at"],
+        "service_windows": list(reversed(payload["service_windows"])),
+    }
+    responses = [
+        client.post(f"/plans/{plan['id']}/window-preview", json=body).json()
+        for body in (payload, shuffled, payload)
+    ]
+    assert responses[0] == responses[1] == responses[2]
+
+
+# ---------------------------------------------------------------------------
 # POST /plans/{id}/ownership-audit
 # ---------------------------------------------------------------------------
 

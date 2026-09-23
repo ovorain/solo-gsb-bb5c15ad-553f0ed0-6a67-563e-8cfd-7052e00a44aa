@@ -49,9 +49,14 @@ from .schemas import (
     SlackReport,
     TimelineAuditRequest,
     TimelineAuditResult,
+    ServiceWindowTiming,
     Wave,
+    WaveWindow,
+    WindowPreviewRequest,
+    WindowPreviewResult,
 )
 from .slack import compute_slack
+from .windows import preview_windows
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -72,12 +77,14 @@ app = FastAPI(
         "of a rollout against completed and failed services, preview "
         "minimum rollback waves for the currently deployed services, "
         "audit the actual per-service execution timeline against the stored "
-        "waves and dependency DAG, audit service-to-team ownership against "
-        "the stored dependency graph, waves and fault domains (cross-team "
-        "dependencies, unowned services, on-call overload and fault-domain "
-        "team coupling), report per-service wave slack (float) of "
-        "the stored minimum-wave plan, and offline-archive/restore complete "
-        "plans as content-addressed (SHA-256) JSON bundles."
+        "waves and dependency DAG, preview the earliest feasible wall-clock "
+        "window of every stored wave under per-service positive durations and "
+        "half-open blocked (no-publish) intervals, audit service-to-team "
+        "ownership against the stored dependency graph, waves and fault "
+        "domains (cross-team dependencies, unowned services, on-call overload "
+        "and fault-domain team coupling), report per-service wave slack "
+        "(float) of the stored minimum-wave plan, and offline-archive/restore "
+        "complete plans as content-addressed (SHA-256) JSON bundles."
     ),
     lifespan=lifespan,
 )
@@ -110,12 +117,25 @@ _SERVICE_LIST_FIELDS = (
     "failed_services",
     "deployed_services",
     "service_timelines",
+    "service_windows",
 )
 
 # Trailing loc elements that name a *property* of a nested object rather than
 # a service id, so they must not be reported as the offending service.
 _NESTED_FIELD_NAMES = frozenset(
-    ("service", "depends_on", "domain", "services", "started_at", "finished_at")
+    (
+        "service",
+        "depends_on",
+        "domain",
+        "services",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+        "blocked_windows",
+        "blocked_from",
+        "blocked_to",
+        "start_at",
+    )
 )
 
 
@@ -684,6 +704,69 @@ def audit_plan_timeline(
         service_timings=output.service_timings,
         waves=output.waves,
         critical_chain=output.critical_chain,
+        total_duration_ms=output.total_duration_ms,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/window-preview",
+    response_model=WindowPreviewResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def preview_plan_windows(
+    plan_id: int,
+    payload: WindowPreviewRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> WindowPreviewResult:
+    """Earliest feasible wall-clock windows of the stored waves.
+
+    The stored waves keep their order and membership: every member of a wave
+    starts together, each runs for its reported positive duration, and a wave
+    finishes at the latest member completion. A start at which any member
+    intersects one of its own half-open blocked (no-publish) intervals pushes
+    the whole wave past the conflicting interval end(s), and every following
+    wave then starts at the previous wave's finish. The stored plan is read
+    but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_members = [list(wave["services"]) for wave in stored["waves"]]
+
+    output = preview_windows(services, wave_members, payload)
+
+    return WindowPreviewResult(
+        plan_id=row["id"],
+        name=row["name"],
+        start_at=output.start_at,
+        waves=[
+            WaveWindow(
+                index=wave.index,
+                started_at=wave.started_at,
+                finished_at=wave.finished_at,
+                duration_ms=int(
+                    (wave.finished_at - wave.started_at).total_seconds() * 1000
+                ),
+                services=[
+                    ServiceWindowTiming(
+                        service=service,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_ms=int(
+                            (finished_at - started_at).total_seconds() * 1000
+                        ),
+                    )
+                    for service, (started_at, finished_at) in wave.members.items()
+                ],
+            )
+            for wave in output.waves
+        ],
+        wave_count=row["wave_count"],
+        finished_at=output.finished_at,
         total_duration_ms=output.total_duration_ms,
     )
 

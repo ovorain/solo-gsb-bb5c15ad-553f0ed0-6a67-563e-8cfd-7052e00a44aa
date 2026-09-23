@@ -201,6 +201,69 @@ class TimelineAuditRequest(BaseModel):
     )
 
 
+class BlockedWindow(BaseModel):
+    """One half-open [blocked_from, blocked_to) interval a service cannot run in."""
+
+    blocked_from: datetime = Field(
+        ...,
+        description="Interval start instant, ISO 8601 (naive values are read as UTC)",
+    )
+    blocked_to: datetime = Field(
+        ...,
+        description="Interval end instant, ISO 8601; strictly after blocked_from",
+    )
+
+
+class ServiceWindow(BaseModel):
+    """One service's positive rollout duration and its blocked (no-publish) intervals."""
+
+    service: str = Field(..., min_length=1, description="Service id of the stored plan")
+    duration_ms: int = Field(
+        ...,
+        ge=1,
+        description="Positive rollout duration in whole milliseconds",
+    )
+    blocked_windows: list[BlockedWindow] = Field(
+        default_factory=list,
+        description=(
+            "Half-open intervals [blocked_from, blocked_to) in which this service "
+            "must not be running; every interval must have blocked_to after blocked_from"
+        ),
+    )
+
+    @field_validator("service")
+    @classmethod
+    def _strip_service_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("service id must not be blank")
+        return v
+
+
+class WindowPreviewRequest(BaseModel):
+    """Earliest wall-clock window preview for the stored waves.
+
+    Every service of the plan must be reported once with a positive duration;
+    each service may additionally declare half-open intervals in which it must
+    not be published. Waves keep the stored order: every member of a wave
+    starts together, a wave finishes at the latest member completion, and the
+    next wave starts exactly then. The stored plan is never modified.
+    """
+
+    start_at: datetime = Field(
+        ...,
+        description=(
+            "UTC instant from which the first wave is scheduled at the earliest; "
+            "ISO 8601 (naive values are read as UTC)"
+        ),
+    )
+    service_windows: list[ServiceWindow] = Field(
+        ...,
+        min_length=1,
+        description="One positive duration plus optional blocked intervals per plan service",
+    )
+
+
 class ServiceOwnership(BaseModel):
     """One service -> owning team assignment for the ownership audit."""
 
@@ -521,6 +584,61 @@ class TimelineAuditResult(BaseModel):
         ...,
         ge=0,
         description="Earliest start to latest finish across every service",
+    )
+
+
+# ---- Window (no-publish interval) preview ----------------------------------
+
+
+class ServiceWindowTiming(BaseModel):
+    """One service's scheduled window inside its wave."""
+
+    service: str = Field(..., description="Service id of the stored plan")
+    started_at: datetime = Field(
+        ..., description="Scheduled start instant (shared by every member of the wave)"
+    )
+    finished_at: datetime = Field(..., description="started_at + duration_ms")
+    duration_ms: int = Field(..., ge=1, description="The reported positive duration")
+
+
+class WaveWindow(BaseModel):
+    """One stored wave's earliest feasible wall-clock window."""
+
+    index: int = Field(..., ge=1, description="1-based stored wave number")
+    started_at: datetime = Field(
+        ...,
+        description=(
+            "Earliest feasible common start of every member: the previous wave's "
+            "finished_at (or the requested start_at for wave 1), pushed past all "
+            "member blocked-window conflicts"
+        ),
+    )
+    finished_at: datetime = Field(
+        ..., description="Latest member completion instant in this wave"
+    )
+    duration_ms: int = Field(..., ge=0, description="finished_at - started_at")
+    services: list[ServiceWindowTiming] = Field(
+        ..., description="Scheduled member windows, sorted by service id"
+    )
+
+
+class WindowPreviewResult(BaseModel):
+    """Outcome of a read-only wave-window preview; never persisted."""
+
+    plan_id: int
+    name: str | None
+    start_at: datetime = Field(
+        ..., description="The requested earliest-start instant, normalized to UTC"
+    )
+    waves: list[WaveWindow] = Field(
+        ..., description="Earliest feasible window per stored wave, in stored order"
+    )
+    wave_count: int = Field(..., description="Stored plan wave count (unchanged)")
+    finished_at: datetime = Field(
+        ..., description="Latest finish of the final wave (overall rollout finish)"
+    )
+    total_duration_ms: int = Field(
+        ..., ge=0, description="finished_at - start_at"
     )
 
 
