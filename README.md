@@ -15,6 +15,10 @@ DAG 上按服务实际耗时加权的关键链（只读，不改方案）。
 上限，沿已存依赖图做**只读责任域审计**：跨团队依赖链、无负责人服务、故障域内的
 团队耦合与每团队负责服务数/超限波次，并按依赖拓扑给出需要协同的团队顺序（结果
 稳定排序、不落库）。
+`POST /plans/{id}/window-preview` 基于**已存波次顺序**做只读的发布窗口预览：
+给定 UTC 起始时刻与每个服务的正耗时及不可发布区间，波内服务同时开始、波次结束
+取最晚完成值；某成员与自身禁发区间相交时整波推迟到冲突区间结束后重算，后续波
+从前一波结束后开始（区间左闭右开，结果稳定排序、不落库）。
 `GET /plans/{id}/slack-report` 只读计算当前最优波次方案的**服务松弛度**：在不增加
 总波次数且仍满足依赖、并发与故障域约束的前提下，每个服务最多可以向后移动几个波，
 并列出零松弛的关键服务及受其约束的零松弛下游（使用同一确定性求解器，结果不落库）。
@@ -552,6 +556,86 @@ curl -X POST http://localhost:8000/plans/1/ownership-audit \
 此时全部服务都是 `unowned_services`。审计为只读操作：重复请求得到相同结果（且与
 请求列表顺序无关），不改动已存储方案。
 
+## 发布窗口预览（POST /plans/{id}/window-preview）
+
+对**已存波次方案**（不会被预览修改）按时间轴排布，求每个波次的**最早可行起止
+时刻**。请求给出第一波的 UTC 最早起始时刻 `start_at`，以及方案内**每个服务唯一
+的正耗时** `duration_ms`（整数毫秒）和该服务自己的不可发布区间
+`blocked_windows`（每个区间 `[start_at, end_at)`，**左闭右开**）：
+
+- **波内并行**：同一波的服务在同一时刻同时开始，波次结束时刻取成员完成时刻的
+  **最晚值**（即最大耗时）；后续波从前一波的结束时刻开始尝试。
+- **整波推迟**：若波内**任一**服务的发布窗口与它**自己的**某个禁发区间相交，
+  则把整波开始时刻推迟到**当前冲突区间的结束时刻**后重算；重算后可能撞上更靠后的
+  区间，因此重复该过程直到可行，得到的固定点即最早可行起点。
+- **左闭右开**：恰好在禁发区间结束的时刻开始、或恰好在某区间开始时刻完成都合法
+  （端点相接不算相交）；零宽度区间（`start_at == end_at`）永不阻挡。
+- 时间均按 ISO 8601 解析，不带时区的时间按 UTC 解释，响应统一归一化到 UTC。
+
+```bash
+curl -X POST http://localhost:8000/plans/1/window-preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_at": "2026-09-23T02:00:00Z",
+    "services": [
+      {"service": "db",    "duration_ms": 600000, "blocked_windows": [
+        {"start_at": "2026-09-23T02:05:00Z", "end_at": "2026-09-23T02:20:00Z"}]},
+      {"service": "auth",  "duration_ms": 300000, "blocked_windows": []},
+      {"service": "api",   "duration_ms": 900000, "blocked_windows": []},
+      {"service": "cache", "duration_ms": 120000, "blocked_windows": []},
+      {"service": "web",   "duration_ms": 420000, "blocked_windows": []}
+    ]
+  }'
+```
+
+承接 `payment-platform` 示例（存储波次为 `[db] → [auth] → [api] → [cache, web]`）：
+`db` 的窗口 `[02:00, 02:10)` 与其禁发区间 `[02:05, 02:20)` 相交，整波推迟到
+`02:20` 开始；之后各波顺序后移：
+
+```json
+{
+  "plan_id": 1,
+  "name": "payment-platform",
+  "start_at": "2026-09-23T02:00:00Z",
+  "waves": [
+    {"index": 1, "started_at": "2026-09-23T02:20:00Z", "finished_at": "2026-09-23T02:30:00Z", "duration_ms": 600000, "services": ["db"]},
+    {"index": 2, "started_at": "2026-09-23T02:30:00Z", "finished_at": "2026-09-23T02:35:00Z", "duration_ms": 300000, "services": ["auth"]},
+    {"index": 3, "started_at": "2026-09-23T02:35:00Z", "finished_at": "2026-09-23T02:50:00Z", "duration_ms": 900000, "services": ["api"]},
+    {"index": 4, "started_at": "2026-09-23T02:50:00Z", "finished_at": "2026-09-23T02:57:00Z", "duration_ms": 420000, "services": ["cache", "web"]}
+  ],
+  "wave_count": 4,
+  "total_duration_ms": 2220000
+}
+```
+
+注意第一波的禁发冲突使整体起点推迟到 `02:20`，因此 `total_duration_ms` 是
+第一波**实际**起点 `02:20` 到最后一波结束点 `02:57` 的跨度（37 分钟）。第 4 波
+`[cache, web]` 同时开始，`duration_ms` 取两者耗时的最大值（`web` 的 420 秒），
+即波次结束取最晚完成时刻；`total_duration_ms` 始终包含因禁发区间产生的空窗。
+
+| 字段 | 含义 |
+| --- | --- |
+| `start_at` | 回显请求的最早起始时刻（归一化到 UTC） |
+| `waves[].started_at` / `finished_at` | 该波成员共同的最早可行起点与最晚完成时刻（UTC） |
+| `waves[].duration_ms` | 波内耗时：成员正耗时的最大值（`finished_at - started_at`） |
+| `waves[].services` | 波内成员，按 id 排序（波次按已存顺序） |
+| `total_duration_ms` | 第一波起点到最后一波结束点的毫秒数 |
+
+请求本身做结构校验；**每个已存服务必须恰好出现一次且耗时为正**，否则统一返回
+结构化 **422**：
+
+| issue code | 触发条件 |
+| --- | --- |
+| `unknown_service` | 规格引用了不属于本方案的服务（`constraint=services`） |
+| `duplicate_service_window` | 同一服务出现多条耗时/禁发规格 |
+| `missing_service_window` | 某方案服务缺少耗时规格（覆盖不完整） |
+| `non_positive_service_duration` | 某服务耗时为 0 或负整数毫秒 |
+| `blocked_window_inverted` | 某服务的禁发区间 `end_at` 早于 `start_at` |
+
+耗时不是整数、时间不是合法 ISO 8601、`services` 为空等 schema 问题返回
+`validation_error`（`invalid_request_field`）。预览为只读操作：重复请求得到相同
+结果（且与请求列表顺序无关），方案不存在返回 404。
+
 ## 服务松弛度报告（GET /plans/{id}/slack-report）
 
 对**已存储的最优波次方案**做只读的波次级松弛度（float）分析：在**总波次数不增加**
@@ -817,6 +901,9 @@ curl -X POST http://localhost:8000/plans/import \
 | `timeline_inverted` | 时间线审计：某服务 `finished_at` 早于 `started_at` |
 | `unknown_service` / `duplicate_service_owner` / `missing_service_owner` | 责任域审计：映射引用未知服务 / 同一服务映射多次 / 某条映射团队为空（`ownership`） |
 | `team_oncall_cap_missing` | 责任域审计：拥有服务的团队缺少 `team_oncall_caps` 值班上限声明 |
+| `missing_service_window` / `duplicate_service_window` | 窗口预览：方案服务缺少耗时规格 / 同一服务出现多条规格 |
+| `non_positive_service_duration` | 窗口预览：某服务耗时不是正整数毫秒 |
+| `blocked_window_inverted` | 窗口预览：某服务禁发区间 `end_at` 早于 `start_at` |
 | `bundle_checksum_mismatch` | 归档导入：声明的 SHA-256 与规范 JSON 实算不符（附 `declared`/`actual`） |
 | `bundle_format_unsupported` | 归档导入：归档格式或格式版本不受支持 |
 | `bundle_result_inconsistent` | 归档导入：归档波次不满足归档请求（依赖顺序/并发/故障域/窗口/覆盖不完整） |
@@ -832,6 +919,7 @@ curl -X POST http://localhost:8000/plans/import \
 | POST | `/plans/{id}/rollback-preview` | 回滚波次预览（只读）：上报当前已上线服务，按逆序约束、原并发上限与故障域反亲和生成波次最少且顺序确定的回滚波；上线集合违反依赖闭包时 422 并定位缺失前置 |
 | POST | `/plans/{id}/timeline-audit` | 实际执行时间线审计（只读）：逐服务上报实际起止时间，校验前一波屏障与直接依赖，返回每条违规（服务/约束对象/阻塞服务/重叠毫秒）、各波实际耗时与按服务耗时加权的依赖 DAG 关键链；覆盖缺失、重复、时间倒置或未知服务 422 |
 | POST | `/plans/{id}/ownership-audit` | 责任域审计（只读）：服务 → 团队映射 + 每团队同时值班上限，返回跨团队依赖链、依赖拓扑协同团队顺序、无负责人服务、每团队负责服务数与超限波次、故障域团队耦合；计划不存在/未知或重复服务/缺少负责人/团队上限非法均为结构化 422 |
+| POST | `/plans/{id}/window-preview` | 发布窗口预览（只读）：给定 UTC 起始时刻与每个服务正耗时及不可发布区间，按已存波次顺序求最早可行起止；波内同时开始、波末取最晚完成，与自身禁发区间相交则整波推迟到区间结束后重算，后续波前一波结束后开始（左闭右开）；覆盖缺失/重复/未知服务、非正耗时或区间倒置均为结构化 422，方案不存在 404 |
 | GET | `/plans/{id}/slack-report` | 服务松弛度报告（只读）：用同一确定性求解器求每个服务在不加波且满足依赖/并发/故障域约束下最晚可到的波次与可后移波数，列出零松弛关键服务及其紧依赖零松弛下游；方案不存在 404 |
 | GET | `/plans/{id}/bundle` | 离线归档导出（只读）：规范 JSON 的请求约束 + 求解结果 + 版本元数据，附 `sha256` 与溯源信息；方案不存在 404 |
 | POST | `/plans/import` | 离线归档导入：先校验摘要、格式/schema、依赖/故障域引用与结果一致性，再事务写入新方案（波次原样保留、不重新求解）；新方案 201，重复摘要幂等 200（`reused=true`），任何校验失败 422 且零写入 |

@@ -261,6 +261,108 @@ class OwnershipAuditRequest(BaseModel):
         return values
 
 
+# ---- Deployment window preview ---------------------------------------------
+
+
+class BlockedWindow(BaseModel):
+    """One half-open ``[start_at, end_at)`` no-publish interval of a service.
+
+    A release window may not start while the service is inside such an
+    interval; an interval ending exactly at the candidate start instant does
+    not block (left-closed, right-open). ``start_at == end_at`` is an empty
+    interval and never blocks.
+    """
+
+    start_at: datetime = Field(
+        ...,
+        description="Interval start (inclusive), ISO 8601 (naive values are read as UTC)",
+    )
+    end_at: datetime = Field(
+        ...,
+        description="Interval end (exclusive), ISO 8601; an end before start is a 422",
+    )
+
+
+class ServiceWindowSpec(BaseModel):
+    """One stored service's positive release duration and blocked intervals."""
+
+    service: str = Field(..., min_length=1, description="Service id of the stored plan")
+    duration_ms: int = Field(
+        ...,
+        description="Positive release duration in milliseconds; every stored "
+        "service must be specified exactly once",
+    )
+    blocked_windows: list[BlockedWindow] = Field(
+        default_factory=list,
+        description="Half-open intervals during which this service must not be "
+        "released; overlapping entries are allowed",
+    )
+
+    @field_validator("service")
+    @classmethod
+    def _strip_service_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("service id must not be blank")
+        return v
+
+
+class WindowPreviewRequest(BaseModel):
+    """Earliest feasible wave calendar for a stored plan's fixed wave order.
+
+    The services of every stored wave start simultaneously; a wave ends at
+    the latest service completion. When any member would be released inside
+    one of its own blocked intervals the whole wave is postponed past the
+    conflicting interval and recomputed; later waves begin when the previous
+    wave ends. The stored plan is never modified.
+    """
+
+    start_at: datetime = Field(
+        ...,
+        description="UTC earliest start of the first wave, ISO 8601 (naive "
+        "values are read as UTC)",
+    )
+    services: list[ServiceWindowSpec] = Field(
+        ...,
+        min_length=1,
+        description="Exactly one positive duration per stored service, plus "
+        "that service's no-publish intervals",
+    )
+
+
+class WindowPreviewWave(BaseModel):
+    """One stored wave's earliest feasible calendar window."""
+
+    index: int = Field(..., ge=1, description="1-based stored wave number")
+    started_at: datetime = Field(
+        ..., description="Feasible common start instant of every wave member (UTC)"
+    )
+    finished_at: datetime = Field(
+        ..., description="Latest member completion instant of the wave (UTC)"
+    )
+    duration_ms: int = Field(..., ge=0, description="finished_at - started_at")
+    services: list[str] = Field(..., description="Wave members, sorted")
+
+
+class WindowPreviewResult(BaseModel):
+    """Outcome of a read-only deployment-window preview; never persisted."""
+
+    plan_id: int
+    name: str | None
+    start_at: datetime = Field(
+        ..., description="Requested earliest start, normalized to UTC"
+    )
+    waves: list[WindowPreviewWave] = Field(
+        ..., description="Feasible windows in stored wave order"
+    )
+    wave_count: int = Field(..., description="Stored plan wave count (unchanged)")
+    total_duration_ms: int = Field(
+        ...,
+        ge=0,
+        description="First wave start to last wave finish in milliseconds",
+    )
+
+
 # ---- Response models -------------------------------------------------------
 
 

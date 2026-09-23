@@ -2158,3 +2158,317 @@ def test_ownership_audit_does_not_modify_stored_plan(client):
     assert fetched["waves"] == plan["waves"]
     assert fetched["wave_count"] == plan["wave_count"]
     assert client.get("/plans").json()["total"] == 1
+
+# ---------------------------------------------------------------------------
+# POST /plans/{id}/window-preview
+# ---------------------------------------------------------------------------
+
+
+def _svc_window(service, duration_ms, blocked_windows=None):
+    return {
+        "service": service,
+        "duration_ms": duration_ms,
+        "blocked_windows": blocked_windows or [],
+    }
+
+
+def _window_payload(specs, start_at="2026-09-23T02:00:00Z"):
+    return {"start_at": start_at, "services": specs}
+
+
+def test_window_preview_plain_schedule_without_blocked_intervals(client):
+    # BASE_PAYLOAD stored waves: [a] -> [b, c] -> [d].
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [
+            _svc_window("a", 10_000),
+            _svc_window("b", 10_000),
+            _svc_window("c", 30_000),
+            _svc_window("d", 10_000),
+        ]
+    )
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["plan_id"] == plan["id"]
+    assert body["name"] == plan["name"]
+    assert body["start_at"] == "2026-09-23T02:00:00Z"
+    assert body["wave_count"] == 3
+
+    waves = body["waves"]
+    assert [w["index"] for w in waves] == [1, 2, 3]
+    assert waves[0]["started_at"] == "2026-09-23T02:00:00Z"
+    assert waves[0]["finished_at"] == "2026-09-23T02:00:10Z"
+    assert waves[0]["duration_ms"] == 10_000
+    assert waves[0]["services"] == ["a"]
+    # Wave 2: b and c start together; the wave ends at c's later completion.
+    assert waves[1]["started_at"] == "2026-09-23T02:00:10Z"
+    assert waves[1]["finished_at"] == "2026-09-23T02:00:40Z"
+    assert waves[1]["duration_ms"] == 30_000
+    assert waves[1]["services"] == ["b", "c"]
+    # Wave 3 starts exactly when the previous wave finished.
+    assert waves[2]["started_at"] == "2026-09-23T02:00:40Z"
+    assert waves[2]["finished_at"] == "2026-09-23T02:00:50Z"
+    assert body["total_duration_ms"] == 50_000
+
+
+def test_window_preview_conflict_postpones_whole_wave_and_shifts_later_waves(client):
+    # a runs [02:00, 02:10) but is blocked in [02:05, 02:20): the whole first
+    # wave restarts at 02:20 and every later wave follows.
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                600_000,
+                [{"start_at": "2026-09-23T02:05:00Z", "end_at": "2026-09-23T02:20:00Z"}],
+            ),
+            _svc_window("b", 300_000),
+            _svc_window("c", 300_000),
+            _svc_window("d", 60_000),
+        ]
+    )
+    body = client.post(f"/plans/{plan['id']}/window-preview", json=payload).json()
+    assert [w["started_at"] for w in body["waves"]] == [
+        "2026-09-23T02:20:00Z",
+        "2026-09-23T02:30:00Z",
+        "2026-09-23T02:35:00Z",
+    ]
+    assert body["waves"][0]["finished_at"] == "2026-09-23T02:30:00Z"
+    # First wave actually starts at 02:20 (postponed); last wave ends 02:36.
+    assert body["total_duration_ms"] == 16 * 60_000
+
+
+def test_window_preview_intervals_are_half_open(client):
+    # Blocked interval ends exactly at 02:10: starting then is allowed (the
+    # interval is open on the right), and finishing exactly when a later
+    # interval begins is allowed as well.
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                600_000,
+                [{"start_at": "2026-09-23T02:00:00Z", "end_at": "2026-09-23T02:10:00Z"}],
+            ),
+            _svc_window(
+                "b",
+                300_000,
+                [{"start_at": "2026-09-23T02:15:00Z", "end_at": "2026-09-23T02:40:00Z"}],
+            ),
+            _svc_window("c", 300_000),
+            _svc_window("d", 60_000),
+        ]
+    )
+    body = client.post(f"/plans/{plan['id']}/window-preview", json=payload).json()
+    assert body["waves"][0]["started_at"] == "2026-09-23T02:10:00Z"
+    # b's wave runs [02:20, 02:25); b blocked [02:15, 02:40) intersects -> the
+    # wave moves to 02:40 even though only b (not c) is blocked.
+    assert body["waves"][1]["started_at"] == "2026-09-23T02:40:00Z"
+    assert body["waves"][1]["services"] == ["b", "c"]
+
+
+def test_window_preview_recomputes_after_chained_conflicts(client):
+    # Jump to 02:10 lands inside a second blocked interval [02:05, 02:30), so
+    # the wave must recompute again and finally start at 02:30.
+    plan = _create_plan(client,
+        {"services": ["a"], "dependencies": [], "max_concurrency": 1})
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                600_000,
+                [
+                    {"start_at": "2026-09-23T02:05:00Z", "end_at": "2026-09-23T02:10:00Z"},
+                    {"start_at": "2026-09-23T02:05:00Z", "end_at": "2026-09-23T02:30:00Z"},
+                ],
+            )
+        ]
+    )
+    body = client.post(f"/plans/{plan['id']}/window-preview", json=payload).json()
+    assert body["waves"][0]["started_at"] == "2026-09-23T02:30:00Z"
+    assert body["waves"][0]["finished_at"] == "2026-09-23T02:40:00Z"
+
+
+def test_window_preview_any_member_conflict_moves_to_latest_conflict_end(client):
+    # Two independent waves: [a, b] -> [c, d] under a concurrency cap of 2.
+    plan = _create_plan(
+        client,
+        {"services": ["a", "b", "c", "d"], "dependencies": [], "max_concurrency": 2},
+    )
+    assert [w["services"] for w in plan["waves"]] == [["a", "b"], ["c", "d"]]
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                600_000,
+                [{"start_at": "2026-09-23T02:00:00Z", "end_at": "2026-09-23T02:20:00Z"}],
+            ),
+            _svc_window(
+                "b",
+                300_000,
+                [{"start_at": "2026-09-23T02:00:00Z", "end_at": "2026-09-23T02:30:00Z"}],
+            ),
+            _svc_window("c", 60_000),
+            _svc_window("d", 60_000),
+        ]
+    )
+    body = client.post(f"/plans/{plan['id']}/window-preview", json=payload).json()
+    # Both members conflict at 02:00; the wave resumes past the latest end 02:30.
+    assert body["waves"][0]["started_at"] == "2026-09-23T02:30:00Z"
+    # a is the longest member: wave ends at 02:40.
+    assert body["waves"][0]["finished_at"] == "2026-09-23T02:40:00Z"
+    assert body["waves"][1]["started_at"] == "2026-09-23T02:40:00Z"
+
+
+def test_window_preview_naive_start_is_read_as_utc(client):
+    plan = _create_plan(client,
+        {"services": ["a"], "dependencies": [], "max_concurrency": 1})
+    payload = _window_payload(
+        [_svc_window("a", 1_000)], start_at="2026-09-23T02:00:00"
+    )
+    body = client.post(f"/plans/{plan['id']}/window-preview", json=payload).json()
+    assert body["start_at"] == "2026-09-23T02:00:00Z"
+    assert body["waves"][0]["started_at"] == "2026-09-23T02:00:00Z"
+
+
+def test_window_preview_is_order_independent(client):
+    plan = _create_plan(client)
+    specs = [
+        _svc_window("a", 10_000),
+        _svc_window("b", 20_000),
+        _svc_window("c", 30_000),
+        _svc_window("d", 40_000),
+    ]
+    first = client.post(
+        f"/plans/{plan['id']}/window-preview",
+        json=_window_payload(specs),
+    ).json()
+    second = client.post(
+        f"/plans/{plan['id']}/window-preview",
+        json=_window_payload(list(reversed(specs))),
+    ).json()
+    assert first == second
+
+
+def test_window_preview_missing_service_is_422(client):
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [_svc_window("a", 10_000), _svc_window("b", 10_000), _svc_window("c", 10_000)]
+    )
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    body = r.json()
+    assert body["error"] == "planning_failed"
+    issue = body["issues"][0]
+    assert issue["code"] == "missing_service_window"
+    assert issue["service"] == "d"
+    assert issue["constraint"] == "services"
+
+
+def test_window_preview_unknown_and_duplicate_services_are_422(client):
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [
+            _svc_window("a", 10_000),
+            _svc_window("b", 10_000),
+            _svc_window("c", 10_000),
+            _svc_window("d", 10_000),
+            _svc_window("ghost", 10_000),
+            _svc_window("a", 20_000),
+        ]
+    )
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    codes = {i["code"]: i["service"] for i in r.json()["issues"]}
+    assert codes["unknown_service"] == "ghost"
+    assert codes["duplicate_service_window"] == "a"
+
+
+def test_window_preview_non_positive_duration_is_422(client):
+    plan = _create_plan(client,
+        {"services": ["a"], "dependencies": [], "max_concurrency": 1})
+    payload = _window_payload([_svc_window("a", 0)])
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "non_positive_service_duration"
+    assert issue["service"] == "a"
+    assert issue["context"]["duration_ms"] == 0
+
+
+def test_window_preview_inverted_blocked_window_is_422(client):
+    plan = _create_plan(client,
+        {"services": ["a"], "dependencies": [], "max_concurrency": 1})
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                10_000,
+                [
+                    {"start_at": "2026-09-23T02:10:00Z", "end_at": "2026-09-23T02:00:00Z"}
+                ],
+            )
+        ]
+    )
+    r = client.post(f"/plans/{plan['id']}/window-preview", json=payload)
+    assert r.status_code == 422
+    issue = r.json()["issues"][0]
+    assert issue["code"] == "blocked_window_inverted"
+    assert issue["service"] == "a"
+
+
+def test_window_preview_schema_errors_are_validation_error(client):
+    plan = _create_plan(client)
+    # Non-integer duration and missing start_at.
+    r = client.post(
+        f"/plans/{plan['id']}/window-preview",
+        json={"services": [{"service": "a", "duration_ms": 1.5}]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+    r = client.post(
+        f"/plans/{plan['id']}/window-preview",
+        json={"start_at": "not-a-timestamp", "services": [_svc_window("a", 1)]},
+    )
+    assert r.status_code == 422
+    assert r.json()["error"] == "validation_error"
+
+
+def test_window_preview_plan_not_found_is_404(client):
+    payload = _window_payload([_svc_window("a", 10_000)])
+    r = client.post("/plans/9999/window-preview", json=payload)
+    assert r.status_code == 404
+    assert r.json()["error"] == "not_found"
+
+
+def test_window_preview_does_not_modify_stored_plan(client):
+    plan = _create_plan(client)
+    payload = _window_payload(
+        [
+            _svc_window(
+                "a",
+                600_000,
+                [{"start_at": "2026-09-23T02:00:00Z", "end_at": "2026-09-23T03:00:00Z"}],
+            ),
+            _svc_window("b", 10_000),
+            _svc_window("c", 10_000),
+            _svc_window("d", 10_000),
+        ]
+    )
+    assert (
+        client.post(f"/plans/{plan['id']}/window-preview", json=payload).status_code
+        == 200
+    )
+    # A 422 must not leave any trace either.
+    assert (
+        client.post(
+            f"/plans/{plan['id']}/window-preview",
+            json=_window_payload([_svc_window("ghost", 10_000)]),
+        ).status_code
+        == 422
+    )
+    fetched = client.get(f"/plans/{plan['id']}").json()
+    assert fetched["waves"] == plan["waves"]
+    assert client.get("/plans").json()["total"] == 1

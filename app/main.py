@@ -50,8 +50,11 @@ from .schemas import (
     TimelineAuditRequest,
     TimelineAuditResult,
     Wave,
+    WindowPreviewRequest,
+    WindowPreviewResult,
 )
 from .slack import compute_slack
+from .window_preview import preview_windows
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -115,7 +118,18 @@ _SERVICE_LIST_FIELDS = (
 # Trailing loc elements that name a *property* of a nested object rather than
 # a service id, so they must not be reported as the offending service.
 _NESTED_FIELD_NAMES = frozenset(
-    ("service", "depends_on", "domain", "services", "started_at", "finished_at")
+    (
+        "service",
+        "depends_on",
+        "domain",
+        "services",
+        "started_at",
+        "finished_at",
+        "start_at",
+        "end_at",
+        "duration_ms",
+        "blocked_windows",
+    )
 )
 
 
@@ -684,6 +698,46 @@ def audit_plan_timeline(
         service_timings=output.service_timings,
         waves=output.waves,
         critical_chain=output.critical_chain,
+        total_duration_ms=output.total_duration_ms,
+    )
+
+
+@app.post(
+    "/plans/{plan_id}/window-preview",
+    response_model=WindowPreviewResult,
+    tags=["plans"],
+    responses={404: {"model": ErrorBody}, 422: {"model": ErrorBody}},
+)
+def preview_plan_windows(
+    plan_id: int,
+    payload: WindowPreviewRequest,
+    conn: sqlite3.Connection = Depends(db.get_db),
+) -> WindowPreviewResult:
+    """Preview the earliest feasible calendar windows of the stored waves.
+
+    Every wave's services start together and the wave ends at the latest
+    member completion. A member intersecting one of its own half-open
+    no-publish intervals postpones the whole wave past that interval (with a
+    recompute, possibly repeatedly); later waves start when the previous wave
+    ends. The request must name every stored service exactly once with a
+    positive duration. The stored plan is read but never modified.
+    """
+    row = db.fetch_plan(conn, plan_id)
+    if row is None:
+        return _plan_not_found(plan_id)  # type: ignore[return-value]
+
+    stored = json.loads(row["result_json"])
+    services = list(stored["services"])
+    wave_members = [list(wave["services"]) for wave in stored["waves"]]
+
+    output = preview_windows(services, wave_members, payload)
+
+    return WindowPreviewResult(
+        plan_id=row["id"],
+        name=row["name"],
+        start_at=output.start_at,
+        waves=output.waves,
+        wave_count=len(output.waves),
         total_duration_ms=output.total_duration_ms,
     )
 
